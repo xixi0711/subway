@@ -1,0 +1,19 @@
+# 前端相关
+node_modules/
+dist/
+build/
+*.log
+.npmrc
+.yarnrc
+.pnpm-store/
+
+# 缓存
+.cache/
+.parcel-cache/
+
+# IDE
+.vscode/
+.idea/
+
+# 临时文件
+*.tmp
