@@ -1,164 +1,243 @@
 """
-意图识别模块 - 区分问题类型，走不同处理路径
-1 = 结构化数据查询（线路/站点等数据库查询）
-2 = 非结构化知识（规章/规范等文档检索）
-3 = 闲聊/无关问题
+意图识别模块 - 纯大模型识别
+根据GPT建议优化：强提示词 + 多示例 + 判断优先级 + num_predict=1 + 二次纠正
 """
 
+from typing import Tuple, Dict, Any
 import re
-from typing import Tuple, Optional, Dict
 
+# 意图定义
+INTENT_STATION_INFO = 1
+INTENT_LINE_INFO = 2
+INTENT_PASSENGER_FLOW = 3
+INTENT_ROUTE_RECOMMEND = 4
+INTENT_KNOWLEDGE = 5
+INTENT_CHAT = 6
 
-INTENT_DB_QUERY = 1
-INTENT_KNOWLEDGE = 2
-INTENT_CHAT = 3
-
-
-DB_QUERY_PATTERNS = [
-    r"(?:线路|号线|几号线).*(?:首班|末班|时间|时刻表)",
-    r"(?:首班|末班|首班车|末班车).*(?:线路|号线|几号线)",
-    r"(?:站点|车站|站).*(?:名称|编号|在哪|位置)",
-    r"(?:换乘|转线|如何换)",
-    r"(?:票价|费用|多少钱|费用多少)",
-    r"(?:运行|运营|几点开|几点停)",
-    r"L\d线|\d号线",
-    r"S\d{1,2}站",
-    r"(?:卡号|刷卡|交易|进站|出站)",
-    r"(?:客流|人流|客流量|进出站|客流数据|客流统计)",
-    r"(?:人多|拥挤|客流量大)",
-    r"(?:客流最多|客流最少|客流排行)",
-]
-
-KNOWLEDGE_PATTERNS = [
-    r"(?:故障|事故|紧急|应急|处置)",
-    r"(?:规章|规范|条例|规定|准则)",
-    r"(?:安全|防护|注意|须知|提示)",
-    r"(?:操作|步骤|流程|如何处理|怎么处理)",
-    r"(?:原因|为什么|为何)",
-    r"(?:定义|概念|什么是|什么叫)",
-    r"(?:行李|携带|物品|禁止携带)",
-    r"(?:购票|检票|票务|票价)",
-    r"(?:乘车|候车|上车|下车)",
-]
-
-CHAT_PATTERNS = [
-    r"(?:你好|您好|嗨|hi|hello)",
-    r"(?:谢谢|感谢|多谢)",
-    r"(?:再见|拜拜|下次见)",
-    r"(?:你是谁|叫什么|名字)",
-    r"(?:天气|今天|明天|日期)",
-    r"(?:北京|上海|广州|城市)",
-    r"(?:吃饭|美食|餐厅)",
-    r"(?:新闻|八卦|娱乐)",
-]
-
-
-def recognize_intent(question: str) -> int:
-    """
-    识别问题意图
-
-    Args:
-        question: 用户问题
-
-    Returns:
-        1 = 结构化数据查询（数据库）
-        2 = 非结构化知识（文档检索）
-        3 = 闲聊/无关问题
-    """
-    if not question or not question.strip():
-        return INTENT_CHAT
-
-    question_lower = question.lower()
-
-    db_score = 0
-    for pattern in DB_QUERY_PATTERNS:
-        if re.search(pattern, question_lower):
-            db_score += 1
-
-    knowledge_score = 0
-    for pattern in KNOWLEDGE_PATTERNS:
-        if re.search(pattern, question_lower):
-            knowledge_score += 1
-
-    chat_score = 0
-    for pattern in CHAT_PATTERNS:
-        if re.search(pattern, question_lower):
-            chat_score += 1
-
-    if chat_score > 0 and db_score == 0 and knowledge_score == 0:
-        return INTENT_CHAT
-
-    if knowledge_score > db_score:
-        return INTENT_KNOWLEDGE
-
-    return INTENT_DB_QUERY
+INTENT_NAMES = {
+    INTENT_STATION_INFO: "站点信息查询",
+    INTENT_LINE_INFO: "线路信息查询",
+    INTENT_PASSENGER_FLOW: "客流数据分析",
+    INTENT_ROUTE_RECOMMEND: "线路推荐",
+    INTENT_KNOWLEDGE: "非结构化知识查询",
+    INTENT_CHAT: "闲聊"
+}
 
 
 def get_intent_name(intent: int) -> str:
     """获取意图名称"""
-    names = {
-        INTENT_DB_QUERY: "结构化数据查询",
-        INTENT_KNOWLEDGE: "非结构化知识查询",
-        INTENT_CHAT: "闲聊/无关问题"
+    return INTENT_NAMES.get(intent, "未知")
+
+
+def recognize_intent_with_model(question: str, llm) -> int:
+    """
+    使用大模型进行意图识别 - 纯模型识别
+    根据GPT建议优化：强提示词 + 多示例 + 判断优先级 + 二次纠正
+    """
+    if not question or not question.strip():
+        return INTENT_CHAT
+    
+    # 主提示词 - 强提示词版本
+    main_prompt = f"""你是轨道交通智能问答系统中的"意图识别模块"。
+你的任务只有一个：判断用户问题属于哪一类意图。
+注意：你不是问答助手，不能回答用户问题，不能解释原因。
+
+请从下面6个类别中选择最合适的一个：
+
+1 = 站点信息查询
+含义：用户询问某一个站点的基本信息、位置、设施、换乘线路等。
+示例：
+S1站在哪里
+S2是什么站
+S3属于哪条线路
+介绍一下S5站
+S1站的信息
+哪个站可以换乘L2线
+S7站有什么设施
+S10站的位置
+
+2 = 线路信息查询
+含义：用户询问某一条线路的基本信息、站点列表、首末班车时间、运行情况等。
+示例：
+L1线路有哪些站
+1号线经过哪些站
+L2首班车几点
+L3末班车几点
+介绍一下2号线
+一号线的站点列表
+L5线首末班车时间
+二号线有多少个站
+
+3 = 客流数据分析
+含义：用户询问客流量、人流量、进出站人数、拥挤程度、客流变化、预测或统计等。
+示例：
+今天客流量是多少
+S1昨天进站人数
+哪一站人最多
+早高峰客流怎么样
+预测明天客流
+上周客流变化趋势
+S5站客流数据
+哪个站客流量最大
+进站人数统计
+客流最少的站
+
+4 = 线路推荐
+含义：用户询问从一个站点到另一个站点怎么走、如何乘车、路线规划、换乘方案等。
+示例：
+S1到S10怎么走
+从S2去S8
+S3到S6坐什么线
+从A站到B站怎么换乘
+帮我规划路线
+S5到S9最佳路线
+怎么从S1到S10
+从这里到S7怎么去
+
+5 = 知识查询
+含义：用户询问轨道交通相关知识、乘车规则、安全规定、故障处理、应急措施、行李规定、设施使用、票务问题等。
+示例：
+车门故障怎么办
+乘车有什么规定
+发生火灾怎么办
+票卡丢了怎么办
+轨道交通安全知识
+遇到突发情况怎么处理
+行李重量限制
+禁止携带物品
+安全须知
+故障处理流程
+车门故障咋办
+电梯坏了怎么办
+如何购买车票
+退票规则是什么
+
+6 = 闲聊
+含义：问候、感谢、告别、自我介绍、无关问题，或者不属于轨道交通业务范围的问题。
+示例：
+你好
+谢谢
+再见
+你是谁
+今天天气怎么样
+讲个笑话
+你好呀
+感谢你的帮助
+明天天气
+
+仔细阅读每个类别的定义和示例，根据用户问题的语义判断最合适的意图类别。
+
+输出要求（必须严格遵守）：
+- 只能输出一个数字：1、2、3、4、5、6
+- 不要输出任何解释、说明或标点
+- 不要输出句子或回答问题
+- 只输出数字
+
+用户问题：{question}
+意图编号："""
+
+    # 二次纠正提示词
+    retry_prompt = f"""格式错误！请重新判断。
+只能输出 1、2、3、4、5、6 中的一个数字。
+不要解释，不要回答问题。
+
+用户问题：{question}
+意图编号："""
+
+    def extract_intent(response_str):
+        """从响应中提取意图数字"""
+        match = re.search(r'(\d+)', response_str)
+        if match:
+            intent_num = int(match.group(1))
+            if intent_num in INTENT_NAMES:
+                return intent_num
+        return None
+
+    try:
+        # 第一次调用
+        print("[DEBUG] 意图识别 - 第一次调用模型...")
+        response = llm.invoke(main_prompt)
+        
+        if hasattr(response, 'content'):
+            response_str = response.content.strip()
+        elif isinstance(response, str):
+            response_str = response.strip()
+        else:
+            response_str = str(response).strip()
+        
+        print(f"[DEBUG] 第一次返回: {response_str}")
+        
+        intent = extract_intent(response_str)
+        if intent:
+            return intent
+        
+        # 第二次纠正调用
+        print("[DEBUG] 意图识别 - 格式错误，进行二次纠正...")
+        response = llm.invoke(retry_prompt)
+        
+        if hasattr(response, 'content'):
+            response_str = response.content.strip()
+        elif isinstance(response, str):
+            response_str = response.strip()
+        else:
+            response_str = str(response).strip()
+        
+        print(f"[DEBUG] 第二次返回: {response_str}")
+        
+        intent = extract_intent(response_str)
+        if intent:
+            return intent
+        
+        # 两次都失败，返回知识查询作为兜底
+        return INTENT_KNOWLEDGE
+        
+    except Exception as e:
+        print(f"[ERROR] 大模型意图识别失败: {e}")
+        return INTENT_KNOWLEDGE
+
+
+def parse_entities(question: str) -> Dict[str, Any]:
+    """
+    从问题中抽取实体信息
+    """
+    result = {
+        'stations': [],
+        'lines': [],
+        'start_station': None,
+        'end_station': None
     }
-    return names.get(intent, "未知")
+    
+    question_lower = question.lower()
+    
+    station_matches = re.findall(r's(\d{1,2})', question_lower)
+    for match in station_matches:
+        station = f"S{int(match)}"
+        if station not in result['stations']:
+            result['stations'].append(station)
+    
+    line_matches = re.findall(r'l(\d{1,2})', question_lower)
+    for match in line_matches:
+        line = f"L{int(match)}"
+        if line not in result['lines']:
+            result['lines'].append(line)
+    
+    if len(result['stations']) >= 2:
+        result['start_station'] = result['stations'][0]
+        result['end_station'] = result['stations'][-1]
+    
+    return result
 
 
-def route_question(question: str) -> Tuple[int, str]:
+def route_question(question: str, llm=None) -> Tuple[int, str, Dict[str, Any]]:
     """
     路由问题到对应的处理路径
-
-    Returns:
-        (意图类型, 建议的处理方式)
     """
-    intent = recognize_intent(question)
-
-    if intent == INTENT_DB_QUERY:
-        return intent, "将根据问题生成SQL查询数据库，获取线路/站点/时刻表等信息"
-    elif intent == INTENT_KNOWLEDGE:
-        return intent, "将从知识库检索相关文档，结合AI生成回答"
+    if llm:
+        intent = recognize_intent_with_model(question, llm)
     else:
-        return intent, "将引导用户提问地铁相关问题或进行友好对话"
-
-
-def parse_db_query(question: str) -> Optional[Dict[str, str]]:
-    """
-    解析数据库查询问题，提取查询意图
-
-    Returns:
-        解析结果，如 {"type": "line_schedule", "line": "L1"}
-    """
-    question_lower = question.lower()
-
-    line_match = re.search(r"(L\d|\d号线|(\w+)号线|(\w+)线)", question_lower)
-    line = line_match.group(1) if line_match else None
-
-    # 只匹配真正的站点编号（如S1, S10），不区分大小写
-    station_match = re.search(r"s\d{1,2}", question_lower)
-    station = station_match.group(0).upper() if station_match else None
-
-    # 检查是否包含客流相关关键词
-    has_passenger_flow = bool(re.search(r"客流|人流|客流量", question_lower))
+        intent = INTENT_KNOWLEDGE
     
-    # 优先处理客流相关问题
-    if has_passenger_flow:
-        if station:
-            return {"type": "passenger_flow_station", "station": station}
-        elif re.search(r"最多|排行|top", question_lower):
-            return {"type": "passenger_flow_top"}
-        else:
-            return {"type": "passenger_flow_stats"}
-    elif re.search(r"首班", question_lower):
-        return {"type": "first_train", "line": line}
-    elif re.search(r"末班", question_lower):
-        return {"type": "last_train", "line": line}
-    elif re.search(r"换乘", question_lower):
-        return {"type": "transfer", "line": line}
-    elif re.search(r"站点|车站", question_lower):
-        return {"type": "stations", "line": line}
-    elif re.search(r"时刻表|时间表", question_lower):
-        return {"type": "timetable", "line": line}
-    elif re.search(r"票价|费用|钱", question_lower):
-        return {"type": "price", "line": line}
-    else:
-        return {"type": "general", "line": line}
+    entities = parse_entities(question)
+    intent_name = get_intent_name(intent)
+    
+    return (intent, intent_name, entities)

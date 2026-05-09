@@ -50,6 +50,9 @@
             <a-select-option value="下行">下行</a-select-option>
           </a-select>
         </a-form-item>
+        <a-form-item label="途经站点编号" name="途经站点编号">
+          <a-input v-model:value="formData['途经站点编号']" placeholder="例如：S1" />
+        </a-form-item>
         <a-form-item label="到站时间" name="到站时间">
           <a-time-picker v-model:value="formData['到站时间']" format="HH:mm" />
         </a-form-item>
@@ -76,6 +79,7 @@ const formData = reactive({
   '列车编号': '',
   '所属线路编号': '',
   '运行方向': '上行',
+  '途经站点编号': '',
   '到站时间': null,
   '发车时间': null
 })

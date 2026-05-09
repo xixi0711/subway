@@ -92,6 +92,30 @@
             format="HH:mm" 
           />
         </a-form-item>
+        <a-form-item label="起点站点" name="起点站点">
+          <a-input 
+            v-model:value="formData['起点站点']" 
+            placeholder="例如：S1" 
+          />
+        </a-form-item>
+        <a-form-item label="终点站点" name="终点站点">
+          <a-input 
+            v-model:value="formData['终点站点']" 
+            placeholder="例如：S10" 
+          />
+        </a-form-item>
+        <a-form-item label="站点列表" name="站点列表">
+          <a-input 
+            v-model:value="formData['站点列表']" 
+            placeholder="逗号分隔，例如：S1,S2,S3" 
+          />
+        </a-form-item>
+        <a-form-item label="线路颜色" name="线路颜色">
+          <a-input 
+            v-model:value="formData['线路颜色']" 
+            placeholder="例如：#1890ff" 
+          />
+        </a-form-item>
       </a-form>
     </a-modal>
   </div>
@@ -115,7 +139,11 @@ const formData = reactive({
   '线路编号': '',
   '线路名称': '',
   '首班车时间': null,
-  '末班车时间': null
+  '末班车时间': null,
+  '起点站点': '',
+  '终点站点': '',
+  '站点列表': '',
+  '线路颜色': '#1890ff'
 })
 
 const rules = {
@@ -166,6 +194,10 @@ const handleEdit = (record) => {
   editingLine.value = record
   formData['线路编号'] = record['线路编号']
   formData['线路名称'] = record['线路名称']
+  formData['起点站点'] = record['起点站点'] || ''
+  formData['终点站点'] = record['终点站点'] || ''
+  formData['站点列表'] = record['站点列表'] || ''
+  formData['线路颜色'] = record['线路颜色'] || '#1890ff'
   
   // 处理时间字段，从字符串转换为dayjs对象
   if (record['首班车时间']) {
@@ -232,7 +264,11 @@ const handleCancel = () => {
     '线路编号': '',
     '线路名称': '',
     '首班车时间': null,
-    '末班车时间': null
+    '末班车时间': null,
+    '起点站点': '',
+    '终点站点': '',
+    '站点列表': '',
+    '线路颜色': '#1890ff'
   })
 }
 </script>

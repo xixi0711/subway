@@ -36,26 +36,34 @@ from cache_utils import (
 from rag_knowledge_base import (
     get_retrieval_context,
     add_knowledge,
-    build_knowledge_base,
-    rag_system
+    build_knowledge_base
 )
 from intent_recognition import (
-    recognize_intent,
+    recognize_intent_with_model,
     get_intent_name,
-    route_question,
-    parse_db_query,
-    INTENT_DB_QUERY,
+    parse_entities,
+    INTENT_STATION_INFO,
+    INTENT_LINE_INFO,
+    INTENT_PASSENGER_FLOW,
+    INTENT_ROUTE_RECOMMEND,
     INTENT_KNOWLEDGE,
     INTENT_CHAT
 )
+from tools import (
+    SQLQueryEngine,
+    PassengerFlowAnalyzer,
+    RoutePlanner
+)
 
-from langchain_agent import get_agent, LangChainAgent
+
 
 from calculate_passenger_flow import (
     calculate_passenger_flow,
     get_station_passenger_flow,
     get_top_stations
 )
+
+
 
 # 加载.env文件
 load_dotenv()
@@ -74,14 +82,11 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen:7b")
 print(f"火山引擎API配置: URL={ARK_API_URL}, Model={MODEL_NAME}")
 print(f"Ollama配置: {'启用' if USE_OLLAMA else '禁用'}, 模型: {OLLAMA_MODEL}")
 
-# 构建RAG知识库
+# 构建RAG知识库（延迟初始化，第一次使用时才加载）
 print("=" * 50)
-print("正在初始化RAG知识库...")
-try:
-    count = build_knowledge_base("./knowledge_base")
-    print(f"RAG知识库构建完成，共加载 {count} 个文档")
-except Exception as e:
-    print(f"RAG知识库初始化失败: {e}")
+print("RAG知识库将在第一次使用时加载...")
+# 注意：vector_db 已存在，不需要重新构建
+# 如果需要重建，可以调用 /api/knowledge/build 接口
 
 # 清空缓存
 print("正在清空缓存...")
@@ -154,7 +159,7 @@ async def get_all_lines():
 
 @app.post("/api/lines")
 async def create_or_update_line(line_data: dict):
-    """创建或更新线路信息"""
+    """创建或更新线路信息（包含路径信息）"""
     try:
         conn = get_db_connection()
         try:
@@ -165,18 +170,25 @@ async def create_or_update_line(line_data: dict):
             existing_line = cursor.fetchone()
             
             if existing_line:
-                # 更新线路
+                # 更新线路（包含路径信息）
                 cursor.execute("""
                     UPDATE 线路信息表 
-                    SET 线路名称 = ?, 首班车时间 = ?, 末班车时间 = ? 
+                    SET 线路名称 = ?, 首班车时间 = ?, 末班车时间 = ?, 
+                        起点站点 = ?, 终点站点 = ?, 站点列表 = ?, 线路颜色 = ?
                     WHERE 线路编号 = ?
-                """, (line_data['线路名称'], line_data['首班车时间'], line_data['末班车时间'], line_data['线路编号']))
+                """, (line_data['线路名称'], line_data['首班车时间'], line_data['末班车时间'],
+                      line_data.get('起点站点', ''), line_data.get('终点站点', ''), 
+                      line_data.get('站点列表', ''), line_data.get('线路颜色', '#1890ff'),
+                      line_data['线路编号']))
             else:
-                # 创建线路
+                # 创建线路（包含路径信息）
                 cursor.execute("""
-                    INSERT INTO 线路信息表 (线路编号, 线路名称, 首班车时间, 末班车时间) 
-                    VALUES (?, ?, ?, ?)
-                """, (line_data['线路编号'], line_data['线路名称'], line_data['首班车时间'], line_data['末班车时间']))
+                    INSERT INTO 线路信息表 (线路编号, 线路名称, 首班车时间, 末班车时间, 
+                                            起点站点, 终点站点, 站点列表, 线路颜色) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (line_data['线路编号'], line_data['线路名称'], line_data['首班车时间'], line_data['末班车时间'],
+                      line_data.get('起点站点', ''), line_data.get('终点站点', ''), 
+                      line_data.get('站点列表', ''), line_data.get('线路颜色', '#1890ff')))
             
             return {"code": 200, "message": "success", "data": line_data}
         finally:
@@ -318,19 +330,19 @@ async def create_or_update_timetable(timetable_data: dict):
                 # 更新时刻表
                 cursor.execute("""
                     UPDATE 列车时刻表 
-                    SET 所属线路编号 = ?, 所属交路编号 = ?, 运行方向 = ?, 到站时间 = ?, 发车时间 = ? 
+                    SET 所属线路编号 = ?, 运行方向 = ?, 到站时间 = ?, 发车时间 = ? 
                     WHERE 列车编号 = ? AND 途经站点编号 = ?
-                """, (timetable_data['所属线路编号'], timetable_data['所属交路编号'], 
+                """, (timetable_data['所属线路编号'], 
                        timetable_data['运行方向'], timetable_data['到站时间'], 
                        timetable_data['发车时间'], timetable_data['列车编号'], 
                        timetable_data['途经站点编号']))
             else:
                 # 创建时刻表
                 cursor.execute("""
-                    INSERT INTO 列车时刻表 (列车编号, 所属线路编号, 所属交路编号, 运行方向, 途经站点编号, 到站时间, 发车时间) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO 列车时刻表 (列车编号, 所属线路编号, 运行方向, 途经站点编号, 到站时间, 发车时间) 
+                    VALUES (?, ?, ?, ?, ?, ?)
                 """, (timetable_data['列车编号'], timetable_data['所属线路编号'], 
-                       timetable_data['所属交路编号'], timetable_data['运行方向'], 
+                       timetable_data['运行方向'], 
                        timetable_data['途经站点编号'], timetable_data['到站时间'], 
                        timetable_data['发车时间']))
             
@@ -448,12 +460,13 @@ async def delete_card_record(record_id: str):
 @app.post("/api/ai-query")
 async def ai_query(request: dict):
     """
-    增强版AI智能问答接口
+    增强版AI智能问答接口 - 采用大模型进行语义理解
 
-    特性：
-    1. 缓存加速：重复问题直接返回缓存结果
-    2. 意图识别：根据问题类型走不同处理路径
-    3. RAG增强：结合知识库检索提升回答质量
+    处理流程：
+    1. 意图识别：使用大模型进行语义理解，判断意图类别
+    2. SQL查询：根据意图调用专用SQL查询引擎
+    3. 工具调用：客流分析和路径规划使用专用工具处理
+    4. 回答生成：将数据和问题提交给大模型生成自然语言回答
     """
     try:
         question = request.get('question', '').strip()
@@ -465,101 +478,283 @@ async def ai_query(request: dict):
             }}
 
         start_time = time.time()
+        used_model = False
+        is_ollama = False
 
-        # 禁用缓存，确保实时查询数据库
-        # cached_answer = get_cached_response(question)
-        # if cached_answer:
-        #     return {"code": 200, "message": "success", "data": {
-        #         "answer": cached_answer,
-        #         "cached": True,
-        #         "intent": None,
-        #         "response_time": time.time() - start_time
-        #     }}
-
-        intent = recognize_intent(question)
-        intent_name = get_intent_name(intent)
-        
+        # 步骤1：意图识别（使用大模型进行语义理解）
         print(f"[DEBUG] 用户问题: {question}")
+        
+        llm_intent = None
+        llm_answer = None
+        USE_ARK_API = os.environ.get("USE_ARK_API", "false").lower() == "true"
+        
+        # 优先使用Ollama本地模型
+        if USE_OLLAMA:
+            try:
+                from langchain_community.llms import Ollama
+                
+                # 设置GPU环境变量
+                os.environ["OLLAMA_GPU_LAYERS"] = "33"
+                
+                # 意图识别专用模型 - 限制输出长度 + GPU加速
+                llm_intent = Ollama(
+                    model=OLLAMA_MODEL, 
+                    temperature=0,
+                    num_predict=1,
+                    top_p=0.1,
+                    top_k=1
+                )
+                print("[DEBUG] 已加载Ollama本地模型（意图识别专用，num_predict=1，GPU加速）")
+                
+                # 回答问题专用模型 - 正常配置 + GPU加速
+                llm_answer = Ollama(
+                    model=OLLAMA_MODEL, 
+                    temperature=0.1
+                )
+                print("[DEBUG] 已加载Ollama本地模型（回答专用，正常配置，GPU加速）")
+                is_ollama = True
+            except Exception as e:
+                print(f"[WARNING] 无法加载Ollama模型: {e}")
+        
+        # 如果Ollama不可用，尝试使用火山引擎API
+        if (not llm_intent or not llm_answer) and USE_ARK_API:
+            try:
+                from langchain.chat_models import ChatOpenAI
+                llm_intent = ChatOpenAI(
+                    base_url=ARK_API_URL,
+                    api_key=ARK_API_KEY,
+                    model_name=MODEL_NAME,
+                    temperature=0
+                )
+                llm_answer = ChatOpenAI(
+                    base_url=ARK_API_URL,
+                    api_key=ARK_API_KEY,
+                    model_name=MODEL_NAME,
+                    temperature=0.7,
+                    max_tokens=2000
+                )
+                print("[DEBUG] 已加载火山引擎API模型")
+            except Exception as e:
+                print(f"[WARNING] 无法加载火山引擎API: {e}")
+        
+        if llm_intent:
+            print("[DEBUG] 使用大模型进行意图识别")
+            intent = recognize_intent_with_model(question, llm_intent)
+            used_model = True
+        else:
+            print("[DEBUG] 大模型不可用，使用默认意图")
+            intent = INTENT_KNOWLEDGE
+        
+        intent_name = get_intent_name(intent)
+        entities = parse_entities(question)
+        
         print(f"[DEBUG] 识别意图: {intent_name} (代码: {intent})")
+        print(f"[DEBUG] 抽取实体: {entities}")
 
+        # 步骤2：根据意图进行处理
+        # 2.1 闲聊意图
         if intent == INTENT_CHAT:
             chat_response = handle_chat_intent(question)
             print(f"[DEBUG] 闲聊响应: {chat_response}")
             if chat_response:
-                cache_response(question, chat_response)
                 return {"code": 200, "message": "success", "data": {
                     "answer": chat_response,
                     "intent": intent_name,
+                    "slots": entities,
+                    "confidence": 0.95,
+                    "used_model": used_model,
                     "response_time": time.time() - start_time
                 }}
 
-        # 使用传统方式处理（稳定可靠）
-        print("[DEBUG] 使用传统方式处理")
-
-        subway_knowledge = get_subway_knowledge_from_db()
-        print(f"[DEBUG] 数据库知识长度: {len(subway_knowledge)} 字符")
-
-        if intent == INTENT_DB_QUERY:
-            db_query = parse_db_query(question)
-            print(f"[DEBUG] 解析的数据库查询: {db_query}")
-            if db_query and 'type' in db_query:
-                query_type = db_query['type']
-                
-                # 客流数据相关查询
-                if query_type.startswith('passenger_flow'):
-                    if query_type == 'passenger_flow_station' and 'station' in db_query:
-                        station = db_query['station']
-                        flow_data = get_station_passenger_flow(station)
-                        if flow_data:
-                            subway_knowledge += f"\n{station}站客流数据：\n"
-                            for item in flow_data:
-                                subway_knowledge += f"- {item['统计日期']}：进站{item['进站人数']}人，出站{item['出站人数']}人，总客流{item['总客流']}人\n"
-                    elif query_type == 'passenger_flow_top':
-                        top_stations = get_top_stations(5)
-                        if top_stations:
-                            subway_knowledge += "\n客流最多的站点：\n"
-                            for i, station in enumerate(top_stations, 1):
-                                subway_knowledge += f"{i}. {station['站点编号']}站：总客流{station['总客流']}人\n"
-                    elif query_type == 'passenger_flow_stats':
-                        conn = get_db_connection()
-                        try:
-                            cursor = conn.cursor()
-                            cursor.execute('SELECT SUM(总客流) as 总客流 FROM 客流统计表')
-                            total_flow = cursor.fetchone()[0] or 0
-                            cursor.execute('SELECT COUNT(DISTINCT 站点编号) as 站点数量 FROM 客流统计表')
-                            station_count = cursor.fetchone()[0] or 0
-                            cursor.execute('SELECT MIN(统计日期) as 开始日期, MAX(统计日期) as 结束日期 FROM 客流统计表')
-                            date_range = cursor.fetchone()
-                            start_date = date_range[0] or ''
-                            end_date = date_range[1] or ''
-                            
-                            subway_knowledge += f"\n客流统计概览：\n"
-                            subway_knowledge += f"- 总客流：{total_flow}人次\n"
-                            subway_knowledge += f"- 统计站点：{station_count}个\n"
-                            subway_knowledge += f"- 统计日期：{start_date} 至 {end_date}\n"
-                        finally:
-                            close_db_connection(conn)
-
-        knowledge_context = ""
+        # 2.2 非结构化知识查询意图
         if intent == INTENT_KNOWLEDGE:
+            print("[DEBUG] 非结构化知识查询，使用RAG检索")
             knowledge_context = get_retrieval_context(question, k=3)
             if knowledge_context:
                 print(f"RAG检索到 {len(knowledge_context)} 字的相关知识")
+            
+            # 调用大模型生成回答
+            if llm_answer:
+                answer = generate_answer_with_context(question, "", knowledge_context, llm_answer, is_ollama)
+                used_model = True
+            else:
+                answer = f"根据知识库，关于\"{question}\"的相关信息如下：\n{knowledge_context}" if knowledge_context else "暂无相关信息"
+            
+            return {"code": 200, "message": "success", "data": {
+                "answer": answer,
+                "intent": intent_name,
+                "slots": entities,
+                "confidence": 0.9,
+                "used_model": used_model,
+                "response_time": time.time() - start_time
+            }}
 
-        answer = generate_answer_with_context(
-            question,
-            subway_knowledge,
-            knowledge_context
-        )
+        # 2.3 站点信息查询意图
+        if intent == INTENT_STATION_INFO:
+            print("[DEBUG] 站点信息查询")
+            station_id = entities.get('stations')[0] if entities.get('stations') else None
+            
+            # 调用专用SQL查询引擎
+            query_result = SQLQueryEngine.query_station_info(station_id)
+            print(f"[DEBUG] SQL查询结果: {query_result}")
+            
+            if query_result['success']:
+                data_str = json.dumps(query_result['data'], ensure_ascii=False, indent=2)
+                # 将查询结果和问题提交给大模型生成回答
+                if llm_answer:
+                    answer = generate_answer_with_context(question, data_str, "", llm_answer, is_ollama)
+                    used_model = True
+                else:
+                    answer = format_station_info(query_result['data'])
+            else:
+                answer = query_result['message']
+            
+            return {"code": 200, "message": "success", "data": {
+                "answer": answer,
+                "intent": intent_name,
+                "slots": entities,
+                "confidence": 0.95,
+                "used_model": used_model,
+                "response_time": time.time() - start_time
+            }}
 
-        # 禁用缓存，确保实时查询
-        # cache_response(question, answer)
+        # 2.4 线路信息查询意图
+        if intent == INTENT_LINE_INFO:
+            print("[DEBUG] 线路信息查询")
+            line_id = entities.get('lines')[0] if entities.get('lines') else None
+            
+            # 调用专用SQL查询引擎
+            query_result = SQLQueryEngine.query_line_info(line_id)
+            print(f"[DEBUG] SQL查询结果: {query_result}")
+            
+            if query_result['success']:
+                data_str = json.dumps(query_result['data'], ensure_ascii=False, indent=2)
+                # 将查询结果和问题提交给大模型生成回答
+                if llm_answer:
+                    answer = generate_answer_with_context(question, data_str, "", llm_answer, is_ollama)
+                    used_model = True
+                else:
+                    answer = format_line_info(query_result['data'])
+            else:
+                answer = query_result['message']
+            
+            return {"code": 200, "message": "success", "data": {
+                "answer": answer,
+                "intent": intent_name,
+                "slots": entities,
+                "confidence": 0.95,
+                "used_model": used_model,
+                "response_time": time.time() - start_time
+            }}
+
+        # 2.5 客流数据分析意图
+        if intent == INTENT_PASSENGER_FLOW:
+            print("[DEBUG] 客流数据分析")
+            
+            question_lower = question.lower()
+            station_id = entities.get('stations')[0] if entities.get('stations') else None
+            
+            # 根据问题类型选择不同的分析方法
+            if any(keyword in question_lower for keyword in ["最多", "第二", "排行", "排名", "最少"]):
+                # 客流排名查询
+                analysis_result = PassengerFlowAnalyzer.get_flow_ranking()
+            elif station_id and any(keyword in question_lower for keyword in ["哪一天", "日期", "几号"]):
+                # 站点指定日期客流查询（提取日期）
+                import re
+                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', question)
+                date = date_match.group(1) if date_match else None
+                analysis_result = PassengerFlowAnalyzer.get_station_flow_by_date(station_id, date)
+            elif station_id:
+                # 站点客流查询
+                analysis_result = PassengerFlowAnalyzer.get_station_flow_by_date(station_id)
+            else:
+                # 整体统计查询
+                analysis_result = PassengerFlowAnalyzer.get_flow_stats()
+            
+            print(f"[DEBUG] 客流分析结果: {analysis_result}")
+            
+            if analysis_result['success']:
+                # 将数据转换为更简洁的格式，便于大模型理解
+                data = analysis_result['data']
+                data_str = format_flow_for_llm(data)
+                print(f"[DEBUG] 格式化后的数据: {data_str[:100]}...")
+                # 将工具输出结果和问题提交给大模型生成回答
+                if llm_answer:
+                    answer = generate_answer_with_context(question, data_str, "", llm_answer, is_ollama)
+                    used_model = True
+                else:
+                    answer = format_flow_data(data)
+            else:
+                answer = analysis_result['message']
+            
+            return {"code": 200, "message": "success", "data": {
+                "answer": answer,
+                "intent": intent_name,
+                "slots": entities,
+                "confidence": 0.95,
+                "used_model": used_model,
+                "response_time": time.time() - start_time
+            }}
+
+        # 2.6 线路推荐意图
+        if intent == INTENT_ROUTE_RECOMMEND:
+            print("[DEBUG] 线路推荐")
+            
+            start_station = entities.get('start_station')
+            end_station = entities.get('end_station')
+            
+            if not start_station or not end_station:
+                # 如果缺少参数，提示用户补充
+                return {"code": 200, "message": "success", "data": {
+                    "answer": "请告诉我起点站和终点站，我来为您规划路线",
+                    "intent": intent_name,
+                    "slots": entities,
+                    "confidence": 0.8,
+                    "used_model": used_model,
+                    "response_time": time.time() - start_time
+                }}
+            
+            # 调用专用路径规划工具
+            route_result = RoutePlanner.find_route(start_station, end_station)
+            print(f"[DEBUG] 路径规划结果: {route_result}")
+            
+            if route_result['success']:
+                data_str = json.dumps(route_result['data'], ensure_ascii=False, indent=2)
+                # 将工具输出结果和问题提交给大模型生成回答
+                if llm_answer:
+                    answer = generate_answer_with_context(question, data_str, "", llm_answer, is_ollama)
+                    used_model = True
+                else:
+                    answer = format_route_info(route_result['data'])
+            else:
+                answer = route_result['message']
+            
+            return {"code": 200, "message": "success", "data": {
+                "answer": answer,
+                "intent": intent_name,
+                "slots": entities,
+                "confidence": 0.95,
+                "used_model": used_model,
+                "response_time": time.time() - start_time
+            }}
+
+        # 默认处理
+        subway_knowledge = get_subway_knowledge_from_db()
+        if llm_answer:
+            answer = generate_answer_with_context(question, subway_knowledge, "", llm_answer, is_ollama)
+            used_model = True
+        else:
+            answer = f"根据现有信息，{question}"
 
         return {"code": 200, "message": "success", "data": {
             "answer": answer,
             "intent": intent_name,
+            "slots": entities,
+            "confidence": 0.85,
+            "used_model": used_model,
             "response_time": time.time() - start_time
         }}
+
     except Exception as e:
         print(f"AI查询错误详情: {e}")
         import traceback
@@ -567,6 +762,90 @@ async def ai_query(request: dict):
         return {"code": 500, "message": "error", "data": {
             "answer": f"抱歉，系统出现错误：{str(e)}"
         }}
+
+
+def format_station_info(data):
+    """格式化站点信息"""
+    if not data:
+        return "暂无站点信息"
+    
+    result = "站点信息如下：\n"
+    for station in data:
+        result += f"- {station.get('站点编号')} {station.get('站点名称', '')}\n"
+        result += f"  所属线路：{station.get('所属线路编号', '')}\n"
+        result += f"  可换乘线路：{station.get('可换乘线路', '无')}\n"
+    return result
+
+
+def format_line_info(data):
+    """格式化线路信息"""
+    if not data:
+        return "暂无线路信息"
+    
+    result = "线路信息如下：\n"
+    for line in data:
+        result += f"- {line.get('线路编号')} {line.get('线路名称', '')}\n"
+        result += f"  首班车：{line.get('首班车时间', '')}\n"
+        result += f"  末班车：{line.get('末班车时间', '')}\n"
+        result += f"  起点站：{line.get('起点站点', '')}\n"
+        result += f"  终点站：{line.get('终点站点', '')}\n"
+    return result
+
+
+def format_flow_data(data):
+    """格式化客流数据"""
+    if not data:
+        return "暂无客流数据"
+    
+    if 'station_id' in data:
+        # 站点客流数据
+        result = f"{data['station_id']}站客流数据：\n"
+        result += f"总客流：{data['summary'].get('total_flow', 0)}人次\n"
+        result += f"日均客流：{data['summary'].get('avg_daily_flow', 0)}人次\n"
+        result += f"最高客流：{data['summary'].get('max_flow', 0)}人次\n"
+        result += f"最低客流：{data['summary'].get('min_flow', 0)}人次\n"
+    else:
+        # 整体统计数据
+        result = "客流统计概览：\n"
+        result += f"总客流：{data.get('total_flow', 0)}人次\n"
+        result += f"统计站点：{data.get('station_count', 0)}个\n"
+        result += f"统计日期：{data.get('date_range', {}).get('start_date', '')} 至 {data.get('date_range', {}).get('end_date', '')}\n"
+    return result
+
+
+def format_route_info(data):
+    """格式化路线信息"""
+    if not data or not data.get('routes'):
+        return "未找到合适的路线"
+    
+    start = data['start_station']
+    end = data['end_station']
+    routes = data['routes']
+    
+    result = f"路线规划：从{start}站到{end}站\n"
+    result += f"共找到 {len(routes)} 条推荐路线\n\n"
+    
+    for idx, route in enumerate(routes, 1):
+        result += f"方案{idx}：{route['description']}\n"
+        result += f"  途经站点：{' → '.join(route['path'])}\n"
+        result += f"  站点总数：{route['stations_count']}站（含起点终点）\n"
+        result += f"  换乘次数：{route['transfers']}次\n"
+        result += f"  途经线路：{', '.join(route['lines'])}\n"
+        
+        if len(route['path']) > 2:
+            result += f"  详细路径：\n"
+            for i, station in enumerate(route['path']):
+                if i == 0:
+                    result += f"    {i+1}. {station}（起点）\n"
+                elif i == len(route['path']) - 1:
+                    result += f"    {i+1}. {station}（终点）\n"
+                else:
+                    result += f"    {i+1}. {station}\n"
+        
+        if idx < len(routes):
+            result += "\n"
+    
+    return result
 
 
 def get_subway_knowledge_from_db() -> str:
@@ -669,78 +948,136 @@ def handle_chat_intent(question: str) -> Optional[str]:
 def generate_answer_with_context(
     question: str,
     subway_knowledge: str,
-    knowledge_context: str = ""
+    knowledge_context: str = "",
+    llm=None,
+    is_ollama: bool = False
 ) -> str:
-    """结合上下文生成回答"""
-    system_content = f"""你是一个专业、友好、详细的地铁信息查询助手。
+    """结合上下文生成回答
+    
+    Args:
+        question: 用户问题
+        subway_knowledge: 地铁知识库
+        knowledge_context: RAG知识上下文
+        llm: 大模型实例
+        is_ollama: 是否使用本地Ollama模型（影响提示词选择）
+    """
+    
+    # 根据是否有 RAG 知识和是否是本地模型来决定提示词
+    if is_ollama:
+        # 本地模型使用简洁提示词
+        if knowledge_context:
+            knowledge_info = knowledge_context
+            print(f"[DEBUG] 使用 RAG 知识（本地模型），长度: {len(knowledge_info)} 字符")
+            user_prompt = f"""你是地铁信息查询专家。请严格按照下面的参考知识回答用户问题。
 
-【可用的地铁信息】
-{subway_knowledge}
-
-【重要】请完整、认真地阅读【可用的地铁信息】，然后给出详细回答！
-
-【回答要求】
-1. 基于上面【可用的地铁信息】回答，不要编造不存在的信息
-2. 回答要尽可能详细、清晰、有条理
-3. 回答时要包含所有相关信息，包括：
-   - 涉及的线路名称和编号
-   - 涉及的站点名称和编号
-   - 换乘信息
-   - 首末班车时间（如果有的话）
-   - 其他相关数据
-4. 结构清晰，使用列表或分段方式组织内容
-5. 即使不确定，也要根据现有信息给出最佳猜测或建议，绝对不要说"抱歉"！
-6. 不要提到"根据您提供的信息"或类似表述
-
-【用户的问题】"""
-
-    if knowledge_context:
-        system_content += f"\n\n参考知识：\n{knowledge_context}"
-
-    # 使用Ollama本地模型
-    if USE_OLLAMA:
-        try:
-            print(f"[DEBUG] 使用Ollama本地模型生成回答")
-            
-            from langchain_community.llms import Ollama
-            llm = Ollama(model=OLLAMA_MODEL, temperature=0.1)
-            
-            knowledge_info = subway_knowledge
-            if knowledge_context:
-                knowledge_info += f"\n\n参考知识：\n{knowledge_context}"
-            
-            print(f"[DEBUG] 输入知识长度: {len(knowledge_info)} 字符")
-            
-            user_prompt = f"""你是地铁信息查询专家。仔细阅读下面的地铁数据库信息，然后准确回答问题。
-
-【地铁线路数据库】
+参考知识：
 {knowledge_info}
 
-【用户问题】
-{question}
+问题：{question}
 
-【回答规则】
-- 必须严格基于上面的数据库信息回答
-- 数字和名称必须完全准确
-- 站点数量要精确统计
-- 首末班车时间要说明具体线路
-- 路线查询要说明详细的换乘方案
-- 用自然、友好的中文表达
-- 如果数据库中没有相关信息，说明"暂无相关信息"
+回答要求：
+1. 只能使用参考知识中的信息，绝对不能编造任何信息
+2. 不要添加任何参考知识中没有的内容或推测
+3. 不要说"根据规定"、"一般来说"等不确定的表述
+4. 如果参考知识中有明确数字（如重量、尺寸），必须准确使用这些数字
+5. 回答要直接、简洁，只输出答案本身
+6. 如果参考知识中没有相关信息，只输出"暂无相关信息"
 
-开始回答："""
+回答："""
+        else:
+            knowledge_info = subway_knowledge
+            print(f"[DEBUG] 使用数据库知识（本地模型），长度: {len(knowledge_info)} 字符")
+            user_prompt = f"""你是地铁信息查询专家。根据提供的数据回答问题。
+
+数据：
+{knowledge_info}
+
+问题：{question}
+
+回答要求：
+1. 只输出答案本身，不要添加任何额外说明、免责声明或客套话
+2. 不要说明数据来源，不要问用户是否需要更多信息
+3. 回答要简洁、直接、准确
+4. 如果没有相关信息，只输出"暂无相关信息"
+
+答案："""
+    else:
+        # 外部API使用详细提示词
+        if knowledge_context:
+            knowledge_info = knowledge_context
+            print(f"[DEBUG] 使用 RAG 知识（外部API），长度: {len(knowledge_info)} 字符")
+            user_prompt = f"""你是地铁信息查询专家。请根据下面的参考知识，详细回答用户的问题。
+
+参考知识：
+{knowledge_info}
+
+问题：{question}
+
+回答要求：
+1. 必须完全基于参考知识回答，不要编造信息
+2. 使用参考知识中的具体数据和规定，引用所有相关细节
+3. 如果参考知识中有明确数字（如重量、尺寸、时间），必须使用这些数字
+4. 回答要详细、自然、有逻辑性，像与人对话一样
+5. 可以适当分段，使用列表或步骤说明让回答更清晰
+6. 如果参考知识中没有相关信息，只说"暂无相关信息"
+
+回答："""
+        else:
+            knowledge_info = subway_knowledge
+            print(f"[DEBUG] 使用数据库知识（外部API），长度: {len(knowledge_info)} 字符")
+            user_prompt = f"""你是地铁信息查询专家。根据提供的数据，详细回答用户的问题。
+
+数据：
+{knowledge_info}
+
+问题：{question}
+
+回答要求：
+1. 基于提供的数据进行详细解答，包含所有相关信息
+2. 使用数据中的具体数字和细节，不要遗漏重要信息
+3. 回答要详细、自然、易懂，可以适当组织成段落或列表
+4. 对于路线规划，描述清楚每一步怎么走
+5. 对于客流数据，说明具体的统计结果和趋势
+6. 如果没有相关信息，只输出"暂无相关信息"
+
+答案："""
+    
+    # 使用传入的llm或创建新的llm
+    if llm:
+        try:
+            # 使用invoke方法调用模型（兼容所有LangChain模型）
+            response = llm.invoke(user_prompt)
             
-            answer = llm(user_prompt)
+            # 处理不同模型的返回类型
+            if hasattr(response, 'content'):
+                answer = response.content.strip()
+            elif isinstance(response, str):
+                answer = response.strip()
+            else:
+                answer = str(response).strip()
+            
+            print(f"[DEBUG] 模型回答: {answer}")
+            answer = answer.replace("问题：", "").replace("回答：", "").replace("答：", "").replace("答案：", "").strip()
+            return answer
+        except Exception as e:
+            print(f"模型调用失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # 如果没有传入llm，尝试使用Ollama
+    if USE_OLLAMA:
+        try:
+            from langchain_community.llms import Ollama
+            llm_local = Ollama(model=OLLAMA_MODEL, temperature=0.1)
+            response = llm_local.invoke(user_prompt)
+            answer = response.strip()
             print(f"[DEBUG] Ollama模型回答: {answer}")
-            
-            answer = answer.strip().replace("问题：", "").replace("回答：", "").replace("答：", "").replace("答案：", "").strip()
-            
+            answer = answer.replace("问题：", "").replace("回答：", "").replace("答：", "").replace("答案：", "").strip()
             return answer
         except Exception as e:
             print(f"Ollama模型调用失败: {e}")
             import traceback
             traceback.print_exc()
-            pass
     
     # 使用API模型
     headers = {
@@ -748,15 +1085,17 @@ def generate_answer_with_context(
         "Authorization": f"Bearer {ARK_API_KEY}"
     }
 
-    # 优化消息格式：将数据库知识和RAG检索知识放在user消息中
-    knowledge_info = f"【可用的地铁信息】\n{subway_knowledge}"
     if knowledge_context:
-        knowledge_info += f"\n\n【参考知识】\n{knowledge_context}"
+        knowledge_info = f"【参考知识】\n{knowledge_context}"
+        system_content = "你是一个专业、友好、详细的地铁信息查询助手。请根据提供的参考知识回答用户问题。"
+    else:
+        knowledge_info = f"【可用的地铁信息】\n{subway_knowledge}"
+        system_content = "你是一个专业、友好、详细的地铁信息查询助手。请根据提供的地铁信息回答用户问题。"
     
     payload = {
         "model": MODEL_NAME,
         "messages": [
-            {"role": "system", "content": "你是一个专业、友好、详细的地铁信息查询助手。请根据提供的地铁信息回答用户问题。"},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": f"{knowledge_info}\n\n【用户的问题】{question}"}
         ],
         "temperature": 0.7,
@@ -872,22 +1211,24 @@ async def get_network_stations():
 
 @app.get("/api/network/lines")
 async def get_network_lines():
-    """获取所有线路的路径信息"""
+    """获取所有线路的路径信息（从线路信息表读取）"""
     try:
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute('SELECT * FROM 线路路径信息表')
+            cursor.execute('SELECT * FROM 线路信息表')
             lines = []
             for row in cursor.fetchall():
                 line = {
                     "路径ID": row[0],
-                    "线路编号": row[1],
-                    "起点站点": row[2],
-                    "终点站点": row[3],
-                    "站点列表": row[4],
-                    "线路颜色": row[5],
-                    "线路名称": row[1]
+                    "线路编号": row[0],
+                    "起点站点": row[4] if len(row) > 4 else '',
+                    "终点站点": row[5] if len(row) > 5 else '',
+                    "站点列表": row[6] if len(row) > 6 else '',
+                    "线路颜色": row[7] if len(row) > 7 else '#1890ff',
+                    "线路名称": row[1],
+                    "首班车时间": row[2] if len(row) > 2 else '',
+                    "末班车时间": row[3] if len(row) > 3 else ''
                 }
                 lines.append(line)
             return {"code": 200, "message": "success", "data": lines}
@@ -932,18 +1273,37 @@ async def add_network_station(station_data: dict):
 
 @app.post("/api/network/lines")
 async def add_network_line(line_data: dict):
-    """添加或更新线路路径信息"""
+    """添加或更新线路路径信息（保存到线路信息表）"""
     try:
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute('''
-            INSERT OR REPLACE INTO 线路路径信息表 (路径ID, 线路编号, 起点站点, 终点站点, 站点列表, 线路颜色)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ''', (line_data['path_id'], line_data['line_id'], line_data['start_station'], 
-                  line_data['end_station'], line_data['station_list'], line_data['line_color']))
+            
+            # 检查线路是否存在
+            cursor.execute('SELECT * FROM 线路信息表 WHERE 线路编号 = ?', (line_data['line_id'],))
+            existing_line = cursor.fetchone()
+            
+            if existing_line:
+                # 更新线路路径信息
+                cursor.execute('''
+                UPDATE 线路信息表 
+                SET 起点站点 = ?, 终点站点 = ?, 站点列表 = ?, 线路颜色 = ?
+                WHERE 线路编号 = ?
+                ''', (line_data['start_station'], line_data['end_station'], 
+                      line_data['station_list'], line_data['line_color'], 
+                      line_data['line_id']))
+            else:
+                # 创建新线路
+                cursor.execute('''
+                INSERT INTO 线路信息表 (线路编号, 线路名称, 首班车时间, 末班车时间, 
+                                        起点站点, 终点站点, 站点列表, 线路颜色)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (line_data['line_id'], line_data.get('line_name', line_data['line_id']),
+                      '', '', line_data['start_station'], line_data['end_station'], 
+                      line_data['station_list'], line_data['line_color']))
+            
             conn.commit()
-            return {"code": 200, "message": "success", "data": {"路径ID": line_data['path_id']}}
+            return {"code": 200, "message": "success", "data": {"路径ID": line_data['line_id']}}
         finally:
             close_db_connection(conn)
     except Exception as e:
@@ -966,12 +1326,12 @@ async def delete_network_station(station_id: str):
 
 @app.delete("/api/network/lines/{path_id}")
 async def delete_network_line(path_id: str):
-    """删除线路路径信息"""
+    """删除线路路径信息（从线路信息表删除）"""
     try:
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute('DELETE FROM 线路路径信息表 WHERE 路径ID = ?', (path_id,))
+            cursor.execute('DELETE FROM 线路信息表 WHERE 线路编号 = ?', (path_id,))
             conn.commit()
             return {"code": 200, "message": "success", "data": {"路径ID": path_id}}
         finally:
@@ -1043,6 +1403,72 @@ async def get_passenger_flow_stats():
             close_db_connection(conn)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+def format_flow_for_llm(data: dict) -> str:
+    """
+    将客流数据格式化为适合大模型理解的文本格式
+    
+    Args:
+        data: 客流数据分析结果
+        
+    Returns:
+        格式化后的文本
+    """
+    result = ""
+    
+    if 'station_id' in data:
+        # 站点客流数据
+        result += f"站点: {data['station_id']}\n"
+        
+        if 'date' in data and data['date']:
+            result += f"查询日期: {data['date']}\n"
+        
+        if 'records' in data:
+            all_records = data['records']
+            result += f"客流记录共 {len(all_records)} 条:\n"
+            for record in all_records:
+                result += f"  - {record['date']}: 进站{record['in_flow']}人, 出站{record['out_flow']}人, 总客流{record['total_flow']}人\n"
+        
+        if 'summary' in data:
+            summary = data['summary']
+            result += "\n统计摘要:\n"
+            result += f"  总客流: {summary.get('total_flow', 0)}人次\n"
+            result += f"  日均客流: {summary.get('avg_daily_flow', 0)}人次\n"
+            result += f"  最大客流: {summary.get('max_flow', 0)}人次\n"
+            result += f"  最小客流: {summary.get('min_flow', 0)}人次\n"
+    
+    elif 'top1' in data:
+        # 客流排名数据
+        result += "客流排名统计:\n"
+        if data['top1']:
+            result += f"  第1名: {data['top1']['station_id']}站, 总客流{data['top1']['total_flow']}人次\n"
+        if data['top2']:
+            result += f"  第2名: {data['top2']['station_id']}站, 总客流{data['top2']['total_flow']}人次\n"
+        if data['top3']:
+            result += f"  第3名: {data['top3']['station_id']}站, 总客流{data['top3']['total_flow']}人次\n"
+        if data['bottom1']:
+            result += f"  最少客流: {data['bottom1']['station_id']}站, 总客流{data['bottom1']['total_flow']}人次\n"
+        if data['bottom2']:
+            result += f"  倒数第2: {data['bottom2']['station_id']}站, 总客流{data['bottom2']['total_flow']}人次\n"
+        
+        if 'all_stations' in data:
+            result += "\n所有站点排名详情:\n"
+            for station in data['all_stations']:
+                result += f"  第{station['rank']}名: {station['station_id']}站, {station['total_flow']}人次\n"
+    
+    elif 'total_flow' in data:
+        # 整体统计数据
+        result += "整体客流统计概览:\n"
+        result += f"  总客流: {data['total_flow']}人次\n"
+        result += f"  统计站点数: {data.get('station_count', 0)}个\n"
+        if 'date_range' in data:
+            result += f"  统计周期: {data['date_range'].get('start_date', '')} 至 {data['date_range'].get('end_date', '')}\n"
+    
+    return result.strip()
+
 
 if __name__ == "__main__":
     import uvicorn

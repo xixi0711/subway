@@ -291,7 +291,9 @@ export const useSubwayStore = defineStore('subway', () => {
       const response = await api.aiQuery(question.trim(), userId)
       if (pendingRequests.value.has(requestId)) {
         if (response.code === 200) {
-          chatMessages.value.push({ type: 'bot', content: response.data.answer })
+          const data = response.data
+          chatMessages.value.push({ type: 'bot', content: data.answer })
+          console.log(`[AI] Intent: ${data.intent}`)
         } else {
           chatMessages.value.push({ type: 'bot', content: '抱歉，我暂时无法回答这个问题，请稍后再试。' })
         }

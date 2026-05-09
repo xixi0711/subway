@@ -14,16 +14,17 @@
 - **AI智能问答** - 基于大模型的智能问答系统，支持自然语言查询
 
 ### AI问答特性
-- 意图识别（数据库查询/知识库检索/闲聊）
-- RAG知识库增强
-- 实时数据库查询
-- 支持外部API和本地模型（Ollama）
+- **意图识别** - 支持6种意图分类（站点信息、线路信息、客流数据、路线规划、知识查询、闲聊）
+- **RAG知识库增强** - 基于向量数据库的语义检索
+- **实时数据库查询** - 自动查询结构化数据
+- **双模型支持** - 支持外部API（火山引擎）和本地模型（Ollama）
+- **智能回答** - 严格基于知识库回答，不编造信息
 
 ## 🛠️ 技术栈
 
 ### 前端
-- Vue 3 + Vite
-- Ant Design Vue
+- Vue 3 + Vite 5
+- Ant Design Vue 4
 - Pinia（状态管理）
 - Vue Router
 - ECharts（图表可视化）
@@ -32,12 +33,13 @@
 - Python 3.10+
 - FastAPI
 - SQLite（数据库）
-- LangChain（RAG）
-- python-dotenv（配置管理）
+- LangChain + LangChain-Community（RAG）
+- ChromaDB（向量数据库）
+- HuggingFace Embeddings
 
 ### AI支持
-- 火山引擎API
-- Ollama本地模型
+- 火山引擎豆包API
+- Ollama本地模型（支持GPU加速）
 
 ## 📁 项目结构
 
@@ -55,13 +57,21 @@ subway_trae_project/
 │   ├── index.html
 │   ├── package.json
 │   └── vite.config.js
-├── backend/                    # 后端项目
-│   ├── subway_api.py           # 主API服务
-│   ├── subway.db               # SQLite数据库
-│   ├── knowledge_base/         # RAG知识库文档
-│   ├── vector_store/           # 向量存储
-│   └── requirements.txt        # Python依赖
+├── subway_api.py               # 主API服务
+├── subway.db                   # SQLite数据库
+├── intent_recognition.py       # 意图识别模块
+├── rag_knowledge_base.py       # RAG知识库模块
+├── tools.py                    # 工具模块（客流分析、路径规划）
+├── cache_utils.py              # 缓存工具
+├── build_kb.py                 # 知识库构建脚本
+├── calculate_passenger_flow.py # 客流计算模块
+├── migrate_db.py               # 数据库迁移脚本
+├── knowledge_base/             # RAG知识库文档
+│   ├── 乘车须知.txt
+│   └── 故障处置规章.txt
+├── requirements.txt            # Python依赖
 ├── .env                        # 环境配置
+├── 技术栈文档.md               # 技术栈说明文档
 └── README.md
 ```
 
@@ -101,7 +111,7 @@ ARK_API_URL=https://ark.cn-beijing.volces.com/api/v3/chat/completions
 MODEL_NAME=your-model-name
 
 # Ollama配置（可选）
-USE_OLLAMA=false
+USE_OLLAMA=true
 OLLAMA_MODEL=qwen:7b
 
 # 数据库配置
@@ -146,11 +156,17 @@ npm run build
 
 ### 客流分析
 - `GET /api/passenger-flow/stats` - 获取客流统计
-- `GET /api/passenger-flow/top` - 获取客流最多的站点
+- `GET /api/passenger-flow/station/{id}` - 获取站点客流数据
+- `POST /api/passenger-flow/calculate` - 计算客流数据
+
+### 线网接口
+- `GET /api/network/stations` - 获取站点地理信息
+- `GET /api/network/lines` - 获取线路路径信息
+- `POST /api/network/layout` - 保存线网布局
 
 ## 🧠 AI模型配置
 
-### 使用外部API（默认）
+### 使用外部API（火山引擎）
 确保 `.env` 中配置正确：
 ```ini
 USE_OLLAMA=false
@@ -168,6 +184,15 @@ ollama pull qwen:7b
 USE_OLLAMA=true
 OLLAMA_MODEL=qwen:7b
 ```
+
+### GPU加速配置（可选）
+为获得更好的性能，可以启用GPU加速：
+1. 安装 NVIDIA CUDA Toolkit
+2. 设置环境变量：
+```bash
+set OLLAMA_GPU_LAYERS=33
+```
+3. 重启 Ollama 服务
 
 ## 📊 数据库结构
 
