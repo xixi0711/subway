@@ -130,6 +130,10 @@ watch(() => route.path, (path) => {
   background: #001529;
   box-shadow: 2px 0 8px rgba(0, 0, 0, 0.1);
   z-index: 10;
+  position: fixed;
+  left: 0;
+  top: 0;
+  bottom: 0;
 
   .logo {
     display: flex;
@@ -240,6 +244,7 @@ watch(() => route.path, (path) => {
   background: #f0f2f5;
   padding: 24px;
   min-height: calc(100vh - 64px);
+  margin-left: 240px;
 }
 
 .page-container {

@@ -3,6 +3,14 @@
     <div class="page-header">
       <h2>AI智能问答</h2>
       <a-space>
+        <a-select
+          v-model:value="selectedModel"
+          style="width: 160px"
+          @change="handleModelChange"
+        >
+          <a-select-option value="ollama">本地模型 (Ollama)</a-select-option>
+          <a-select-option value="ark">火山引擎 (API)</a-select-option>
+        </a-select>
         <a-button @click="handleClearCache" type="default" danger>
           <template #icon><ReloadOutlined /></template>
           清除缓存
@@ -23,7 +31,14 @@
           </div>
           <div class="message-content">
             <div class="message-bubble" :class="msg.type">
-              {{ msg.content }}
+              <span v-if="msg.streaming && msg.content">{{ msg.content }}</span>
+              <span v-else-if="msg.streaming" class="streaming-indicator">正在思考...</span>
+              <span v-else>{{ msg.content }}</span>
+              <span v-if="msg.streaming" class="typing-dots">
+                <span class="dot"></span>
+                <span class="dot"></span>
+                <span class="dot"></span>
+              </span>
             </div>
           </div>
         </div>
@@ -36,6 +51,7 @@
             placeholder="请输入您的问题..."
             @search="handleSend"
             @pressEnter="handleSend"
+            :disabled="store.chatLoading"
             style="flex: 1"
           >
             <template #enterButton>
@@ -63,6 +79,7 @@ const store = useSubwayStore()
 const chatContainer = ref(null)
 const question = ref('')
 const clearingCache = ref(false)
+const selectedModel = ref(localStorage.getItem('selectedModel') || 'ollama')
 
 let userId = localStorage.getItem('userId')
 if (!userId) {
@@ -83,10 +100,23 @@ const handleSend = async () => {
   
   const userQuestion = question.value.trim()
   question.value = ''
-  scrollToBottom()
   
-  await store.sendMessage(userQuestion, userId)
-  scrollToBottom()
+  nextTick(() => {
+    scrollToBottom()
+  })
+  
+  try {
+    await store.sendMessage(userQuestion, userId, selectedModel.value)
+  } finally {
+    nextTick(() => {
+      question.value = ''
+      scrollToBottom()
+    })
+  }
+}
+
+const handleModelChange = () => {
+  localStorage.setItem('selectedModel', selectedModel.value)
 }
 
 const clearHistory = () => {
@@ -184,12 +214,49 @@ onMounted(() => {
   .message-bubble {
     padding: 12px 16px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+    position: relative;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    
+    .streaming-indicator {
+      color: #999;
+      font-style: italic;
+    }
+    
+    .typing-dots {
+      display: inline-block;
+      margin-left: 4px;
+      
+      .dot {
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        margin: 0 1px;
+        background: #999;
+        border-radius: 50%;
+        animation: typing 1.4s infinite;
+        
+        &:nth-child(2) { animation-delay: 0.2s; }
+        &:nth-child(3) { animation-delay: 0.4s; }
+      }
+    }
   }
 
   .chat-input-container {
     padding: 16px;
     border-top: 1px solid #f0f0f0;
     background: white;
+  }
+}
+
+@keyframes typing {
+  0%, 60%, 100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-4px);
   }
 }
 </style>

@@ -31,6 +31,7 @@ cache/
 vector_store/
 vector_db/
 models/
+intent_model/
 
 # IDE相关
 .vscode/

@@ -251,6 +251,7 @@ export const useSubwayStore = defineStore('subway', () => {
 
   // AI聊天相关方法
   const STORAGE_KEY = 'chat_history'
+  const USE_STREAM = true // 使用流式响应
   
   function loadChatHistory() {
     const saved = localStorage.getItem(STORAGE_KEY)
@@ -277,7 +278,7 @@ export const useSubwayStore = defineStore('subway', () => {
     }
   }
   
-  async function sendMessage(question, userId) {
+  async function sendMessage(question, userId, modelType = null) {
     if (!question.trim()) return
     
     chatMessages.value.push({ type: 'user', content: question.trim() })
@@ -287,30 +288,80 @@ export const useSubwayStore = defineStore('subway', () => {
     chatLoading.value = true
     pendingRequests.value.set(requestId, true)
     
-    try {
-      const response = await api.aiQuery(question.trim(), userId)
-      if (pendingRequests.value.has(requestId)) {
-        if (response.code === 200) {
-          const data = response.data
-          chatMessages.value.push({ type: 'bot', content: data.answer })
-          console.log(`[AI] Intent: ${data.intent}`)
-        } else {
-          chatMessages.value.push({ type: 'bot', content: '抱歉，我暂时无法回答这个问题，请稍后再试。' })
-        }
+    // 添加空的 bot 消息用于流式显示
+    let botMessageIndex = chatMessages.value.length
+    chatMessages.value.push({ type: 'bot', content: '', streaming: true })
+    saveChatHistory()
+    
+    let streamComplete = false
+    let hasError = false
+    
+    const onChunk = (data) => {
+      if (!pendingRequests.value.has(requestId)) return
+      
+      if (data.content) {
+        chatMessages.value[botMessageIndex].content += data.content
         saveChatHistory()
+      }
+      
+      if (data.intent) {
+        console.log(`[AI] Intent: ${data.intent}`)
+      }
+      
+      if (data.done) {
+        streamComplete = true
+      }
+    }
+    
+    const onComplete = () => {
+      if (pendingRequests.value.has(requestId)) {
+        chatMessages.value[botMessageIndex].streaming = false
+        saveChatHistory()
+        pendingRequests.value.delete(requestId)
+        if (pendingRequests.value.size === 0) {
+          chatLoading.value = false
+        }
+      }
+    }
+    
+    const onError = (error) => {
+      if (pendingRequests.value.has(requestId)) {
+        console.error('流式AI查询失败:', error)
+        chatMessages.value[botMessageIndex].content = '抱歉，系统出现错误，请稍后再试。'
+        chatMessages.value[botMessageIndex].streaming = false
+        saveChatHistory()
+        pendingRequests.value.delete(requestId)
+        if (pendingRequests.value.size === 0) {
+          chatLoading.value = false
+        }
+      }
+    }
+    
+    try {
+      if (USE_STREAM) {
+        api.aiQueryStream(question.trim(), userId, modelType, onChunk, onComplete, onError)
+      } else {
+        // 回退到非流式
+        const response = await api.aiQuery(question.trim(), userId, modelType)
+        if (pendingRequests.value.has(requestId)) {
+          if (response.code === 200) {
+            const data = response.data
+            chatMessages.value[botMessageIndex].content = data.answer
+            chatMessages.value[botMessageIndex].streaming = false
+            console.log(`[AI] Intent: ${data.intent}`)
+          } else {
+            chatMessages.value[botMessageIndex].content = '抱歉，我暂时无法回答这个问题，请稍后再试。'
+            chatMessages.value[botMessageIndex].streaming = false
+          }
+          saveChatHistory()
+          pendingRequests.value.delete(requestId)
+          if (pendingRequests.value.size === 0) {
+            chatLoading.value = false
+          }
+        }
       }
     } catch (error) {
-      if (pendingRequests.value.has(requestId)) {
-        console.error('AI查询失败:', error)
-        chatMessages.value.push({ type: 'bot', content: '抱歉，系统出现错误，请稍后再试。' })
-        saveChatHistory()
-      }
-    } finally {
-      pendingRequests.value.delete(requestId)
-      // 只有当没有其他请求时才设置loading为false
-      if (pendingRequests.value.size === 0) {
-        chatLoading.value = false
-      }
+      onError(error)
     }
   }
   

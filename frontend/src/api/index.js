@@ -76,8 +76,56 @@ export const api = {
   },
 
   // AI问答
-  aiQuery(question, userId = 'default') {
-    return apiClient.post('/ai-query', { question, user_id: userId })
+  aiQuery(question, userId = 'default', modelType = null) {
+    const payload = { question, user_id: userId }
+    if (modelType) {
+      payload.model_type = modelType
+    }
+    return apiClient.post('/ai-query', payload)
+  },
+  // 流式AI问答
+  aiQueryStream(question, userId = 'default', modelType = null, onChunk, onComplete, onError) {
+    const payload = { question, user_id: userId }
+    if (modelType) {
+      payload.model_type = modelType
+    }
+    
+    fetch('/api/ai-query/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+      .then(async response => {
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n\n')
+          buffer = lines.pop()
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6))
+                onChunk && onChunk(data)
+              } catch (e) {
+                console.error('解析 SSE 数据失败:', e, line)
+              }
+            }
+          }
+        }
+        
+        onComplete && onComplete()
+      })
+      .catch(error => {
+        console.error('流式请求错误:', error)
+        onError && onError(error)
+      })
   },
   clearCache() {
     return apiClient.post('/cache/clear')

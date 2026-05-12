@@ -58,10 +58,10 @@ subway_trae_project/
 │   ├── package.json
 │   └── vite.config.js
 ├── subway_api.py               # 主API服务
-├── subway.db                   # SQLite数据库
-├── intent_recognition.py       # 意图识别模块
+├── subway.db                   # SQLite数据库（git忽略）
+├── intent_recognition.py       # 意图识别模块（小型分类模型）
 ├── rag_knowledge_base.py       # RAG知识库模块
-├── tools.py                    # 工具模块（客流分析、路径规划）
+├── tools.py                    # 工具模块（客流分析、路径规划、数据库）
 ├── cache_utils.py              # 缓存工具
 ├── build_kb.py                 # 知识库构建脚本
 ├── calculate_passenger_flow.py # 客流计算模块
@@ -69,9 +69,14 @@ subway_trae_project/
 ├── knowledge_base/             # RAG知识库文档
 │   ├── 乘车须知.txt
 │   └── 故障处置规章.txt
+├── intent_model/               # 训练好的意图识别模型（git忽略）
 ├── requirements.txt            # Python依赖
-├── .env                        # 环境配置
+├── .env                        # 环境配置（git忽略）
+├── .env.example                # 环境配置示例
 ├── 技术栈文档.md               # 技术栈说明文档
+├── 进展.md                     # 项目进展报告
+├── 技术路线.md                 # 技术路线图
+├── 需求文档.md                 # 需求文档
 └── README.md
 ```
 

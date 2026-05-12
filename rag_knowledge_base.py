@@ -276,5 +276,13 @@ def get_retrieval_context(query: str, k: int = 3) -> str:
     return context
 
 
-# 延迟初始化 - 不在导入时初始化，在第一次使用时才初始化
-# 这样可以避免阻塞主程序启动
+# 立即初始化 - 在模块导入时就初始化向量数据库
+# 避免第一次请求时的长时间加载
+_init()
+
+def preload_rag():
+    """预加载RAG向量数据库（在应用启动时调用）"""
+    global _initialized
+    if not _initialized:
+        _init()
+    print("[RAG] RAG知识库预加载完成")

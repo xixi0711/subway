@@ -13,24 +13,19 @@
 
 
 import os
-import sqlite3
 import json
 import re
 import requests
 import time
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
 from contextlib import asynccontextmanager
 
 from cache_utils import (
-    get_cached_response,
-    cache_response,
-    get_cached_db_knowledge,
-    cache_db_knowledge,
-    get_cache_stats,
     clear_all_caches
 )
 from rag_knowledge_base import (
@@ -39,9 +34,9 @@ from rag_knowledge_base import (
     build_knowledge_base
 )
 from intent_recognition import (
-    recognize_intent_with_model,
     get_intent_name,
     parse_entities,
+    route_question,
     INTENT_STATION_INFO,
     INTENT_LINE_INFO,
     INTENT_PASSENGER_FLOW,
@@ -52,7 +47,9 @@ from intent_recognition import (
 from tools import (
     SQLQueryEngine,
     PassengerFlowAnalyzer,
-    RoutePlanner
+    RoutePlanner,
+    get_db_connection,
+    close_db_connection
 )
 
 
@@ -81,6 +78,58 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen:7b")
 
 print(f"火山引擎API配置: URL={ARK_API_URL}, Model={MODEL_NAME}")
 print(f"Ollama配置: {'启用' if USE_OLLAMA else '禁用'}, 模型: {OLLAMA_MODEL}")
+
+# 全局模型实例（单例模式，避免每次请求重新加载）
+_ollama_llm = None
+_ark_llm = None
+
+def init_llm_models():
+    """初始化大模型实例（在应用启动时调用一次）"""
+    global _ollama_llm, _ark_llm
+    
+    print("=" * 50)
+    print("正在初始化大模型...")
+    
+    # 初始化Ollama本地模型
+    if USE_OLLAMA:
+        try:
+            from langchain_community.llms import Ollama
+            os.environ["OLLAMA_GPU_LAYERS"] = "33"
+            _ollama_llm = Ollama(model=OLLAMA_MODEL, temperature=0.1)
+            print(f"[MODEL] Ollama模型 {OLLAMA_MODEL} 加载成功")
+        except Exception as e:
+            print(f"[WARNING] 无法加载Ollama模型: {e}")
+    
+    # 初始化火山引擎API模型
+    USE_ARK_API = os.environ.get("USE_ARK_API", "false").lower() == "true"
+    if USE_ARK_API:
+        try:
+            from langchain.chat_models import ChatOpenAI
+            _ark_llm = ChatOpenAI(
+                base_url=ARK_API_URL,
+                api_key=ARK_API_KEY,
+                model_name=MODEL_NAME,
+                temperature=0.7,
+                max_tokens=2000
+            )
+            print(f"[MODEL] 火山引擎API模型 {MODEL_NAME} 加载成功")
+        except Exception as e:
+            print(f"[WARNING] 无法加载火山引擎API: {e}")
+    
+    print("大模型初始化完成")
+    print("=" * 50)
+
+def get_llm(model_type=None):
+    """获取大模型实例（复用全局单例）"""
+    if model_type == "ollama":
+        return _ollama_llm
+    elif model_type == "ark":
+        return _ark_llm
+    else:
+        return _ollama_llm if _ollama_llm else _ark_llm
+
+# 预初始化大模型
+init_llm_models()
 
 # 构建RAG知识库（延迟初始化，第一次使用时才加载）
 print("=" * 50)
@@ -118,27 +167,7 @@ async def add_encoding_header(request, call_next):
         response.headers["Content-Type"] = "application/json; charset=utf-8"
     return response
 
-# 数据库连接函数
-def get_db_connection():
-    """获取数据库连接"""
-    print(f"正在连接数据库: {DB_PATH}")
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    print("数据库连接成功")
-    return conn
-
-# 关闭数据库连接
-def close_db_connection(conn):
-    """关闭数据库连接"""
-    try:
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"关闭数据库连接失败: {e}")
-        try:
-            conn.close()
-        except:
-            pass
+# 数据库连接函数（从 tools.py 导入）
 
 # 线路相关接口
 
@@ -467,10 +496,16 @@ async def ai_query(request: dict):
     2. SQL查询：根据意图调用专用SQL查询引擎
     3. 工具调用：客流分析和路径规划使用专用工具处理
     4. 回答生成：将数据和问题提交给大模型生成自然语言回答
+
+    请求参数：
+    - question: 用户问题
+    - user_id: 用户ID
+    - model_type: 模型类型 ("ollama" | "ark")，可选，默认使用.env配置
     """
     try:
         question = request.get('question', '').strip()
         user_id = request.get('user_id', 'default')
+        model_type = request.get('model_type', None)  # 前端选择的模型类型
 
         if not question:
             return {"code": 200, "message": "success", "data": {
@@ -481,72 +516,16 @@ async def ai_query(request: dict):
         used_model = False
         is_ollama = False
 
-        # 步骤1：意图识别（使用大模型进行语义理解）
+        # 步骤1：意图识别（使用训练好的小型分类模型）
         print(f"[DEBUG] 用户问题: {question}")
+        print(f"[DEBUG] 用户选择模型类型: {model_type}")
         
-        llm_intent = None
-        llm_answer = None
-        USE_ARK_API = os.environ.get("USE_ARK_API", "false").lower() == "true"
+        # 使用全局单例模型（用于回答生成）
+        llm = get_llm(model_type)
+        is_ollama = (model_type == "ollama") or (model_type is None and _ollama_llm is not None)
         
-        # 优先使用Ollama本地模型
-        if USE_OLLAMA:
-            try:
-                from langchain_community.llms import Ollama
-                
-                # 设置GPU环境变量
-                os.environ["OLLAMA_GPU_LAYERS"] = "33"
-                
-                # 意图识别专用模型 - 限制输出长度 + GPU加速
-                llm_intent = Ollama(
-                    model=OLLAMA_MODEL, 
-                    temperature=0,
-                    num_predict=1,
-                    top_p=0.1,
-                    top_k=1
-                )
-                print("[DEBUG] 已加载Ollama本地模型（意图识别专用，num_predict=1，GPU加速）")
-                
-                # 回答问题专用模型 - 正常配置 + GPU加速
-                llm_answer = Ollama(
-                    model=OLLAMA_MODEL, 
-                    temperature=0.1
-                )
-                print("[DEBUG] 已加载Ollama本地模型（回答专用，正常配置，GPU加速）")
-                is_ollama = True
-            except Exception as e:
-                print(f"[WARNING] 无法加载Ollama模型: {e}")
-        
-        # 如果Ollama不可用，尝试使用火山引擎API
-        if (not llm_intent or not llm_answer) and USE_ARK_API:
-            try:
-                from langchain.chat_models import ChatOpenAI
-                llm_intent = ChatOpenAI(
-                    base_url=ARK_API_URL,
-                    api_key=ARK_API_KEY,
-                    model_name=MODEL_NAME,
-                    temperature=0
-                )
-                llm_answer = ChatOpenAI(
-                    base_url=ARK_API_URL,
-                    api_key=ARK_API_KEY,
-                    model_name=MODEL_NAME,
-                    temperature=0.7,
-                    max_tokens=2000
-                )
-                print("[DEBUG] 已加载火山引擎API模型")
-            except Exception as e:
-                print(f"[WARNING] 无法加载火山引擎API: {e}")
-        
-        if llm_intent:
-            print("[DEBUG] 使用大模型进行意图识别")
-            intent = recognize_intent_with_model(question, llm_intent)
-            used_model = True
-        else:
-            print("[DEBUG] 大模型不可用，使用默认意图")
-            intent = INTENT_KNOWLEDGE
-        
-        intent_name = get_intent_name(intent)
-        entities = parse_entities(question)
+        # 使用小型分类模型进行意图识别（速度更快）
+        intent, intent_name, entities = route_question(question)
         
         print(f"[DEBUG] 识别意图: {intent_name} (代码: {intent})")
         print(f"[DEBUG] 抽取实体: {entities}")
@@ -574,8 +553,8 @@ async def ai_query(request: dict):
                 print(f"RAG检索到 {len(knowledge_context)} 字的相关知识")
             
             # 调用大模型生成回答
-            if llm_answer:
-                answer = generate_answer_with_context(question, "", knowledge_context, llm_answer, is_ollama)
+            if llm:
+                answer = generate_answer_with_context(question, "", knowledge_context, llm, is_ollama)
                 used_model = True
             else:
                 answer = f"根据知识库，关于\"{question}\"的相关信息如下：\n{knowledge_context}" if knowledge_context else "暂无相关信息"
@@ -599,10 +578,11 @@ async def ai_query(request: dict):
             print(f"[DEBUG] SQL查询结果: {query_result}")
             
             if query_result['success']:
-                data_str = json.dumps(query_result['data'], ensure_ascii=False, indent=2)
+                data_str = format_station_info_for_llm(query_result['data'])
+                print(f"[DEBUG] 格式化后的站点数据:\n{data_str}")
                 # 将查询结果和问题提交给大模型生成回答
-                if llm_answer:
-                    answer = generate_answer_with_context(question, data_str, "", llm_answer, is_ollama)
+                if llm:
+                    answer = generate_answer_with_context(question, data_str, "", llm, is_ollama)
                     used_model = True
                 else:
                     answer = format_station_info(query_result['data'])
@@ -621,17 +601,19 @@ async def ai_query(request: dict):
         # 2.4 线路信息查询意图
         if intent == INTENT_LINE_INFO:
             print("[DEBUG] 线路信息查询")
-            line_id = entities.get('lines')[0] if entities.get('lines') else None
+            lines = entities.get('lines', [])
+            line_id = lines[0] if lines and len(lines) > 0 else None
             
             # 调用专用SQL查询引擎
             query_result = SQLQueryEngine.query_line_info(line_id)
             print(f"[DEBUG] SQL查询结果: {query_result}")
             
             if query_result['success']:
-                data_str = json.dumps(query_result['data'], ensure_ascii=False, indent=2)
+                data_str = format_line_info_for_llm(query_result['data'])
+                print(f"[DEBUG] 格式化后的线路数据:\n{data_str}")
                 # 将查询结果和问题提交给大模型生成回答
-                if llm_answer:
-                    answer = generate_answer_with_context(question, data_str, "", llm_answer, is_ollama)
+                if llm:
+                    answer = generate_answer_with_context(question, data_str, "", llm, is_ollama)
                     used_model = True
                 else:
                     answer = format_line_info(query_result['data'])
@@ -679,8 +661,8 @@ async def ai_query(request: dict):
                 data_str = format_flow_for_llm(data)
                 print(f"[DEBUG] 格式化后的数据: {data_str[:100]}...")
                 # 将工具输出结果和问题提交给大模型生成回答
-                if llm_answer:
-                    answer = generate_answer_with_context(question, data_str, "", llm_answer, is_ollama)
+                if llm:
+                    answer = generate_answer_with_context(question, data_str, "", llm, is_ollama)
                     used_model = True
                 else:
                     answer = format_flow_data(data)
@@ -721,8 +703,8 @@ async def ai_query(request: dict):
             if route_result['success']:
                 data_str = json.dumps(route_result['data'], ensure_ascii=False, indent=2)
                 # 将工具输出结果和问题提交给大模型生成回答
-                if llm_answer:
-                    answer = generate_answer_with_context(question, data_str, "", llm_answer, is_ollama)
+                if llm:
+                    answer = generate_answer_with_context(question, data_str, "", llm, is_ollama)
                     used_model = True
                 else:
                     answer = format_route_info(route_result['data'])
@@ -739,12 +721,11 @@ async def ai_query(request: dict):
             }}
 
         # 默认处理
-        subway_knowledge = get_subway_knowledge_from_db()
-        if llm_answer:
-            answer = generate_answer_with_context(question, subway_knowledge, "", llm_answer, is_ollama)
+        if llm:
+            answer = generate_answer_with_context(question, "", "", llm, is_ollama)
             used_model = True
         else:
-            answer = f"根据现有信息，{question}"
+            answer = "暂无相关信息"
 
         return {"code": 200, "message": "success", "data": {
             "answer": answer,
@@ -764,6 +745,25 @@ async def ai_query(request: dict):
         }}
 
 
+def format_station_info_for_llm(data):
+    """将站点信息格式化为LLM易读的格式"""
+    if not data:
+        return "暂无站点信息"
+    
+    result = ""
+    for station in data:
+        station_id = station.get('站点编号', '')
+        station_name = station.get('站点名称', '')
+        line_ids = station.get('所属线路编号', '')
+        transfer_lines = station.get('可换乘线路', '')
+        
+        result += f"{station_id}（{station_name}）：\n"
+        result += f"  所属线路：{line_ids}\n"
+        result += f"  可换乘线路：{transfer_lines if transfer_lines and transfer_lines != '-' else '无'}\n"
+    
+    return result
+
+
 def format_station_info(data):
     """格式化站点信息"""
     if not data:
@@ -774,6 +774,34 @@ def format_station_info(data):
         result += f"- {station.get('站点编号')} {station.get('站点名称', '')}\n"
         result += f"  所属线路：{station.get('所属线路编号', '')}\n"
         result += f"  可换乘线路：{station.get('可换乘线路', '无')}\n"
+    return result
+
+
+def format_line_info_for_llm(data):
+    """将线路信息格式化为LLM易读的格式"""
+    if not data:
+        return "暂无线路信息"
+    
+    result = ""
+    for line in data:
+        line_id = line.get('线路编号', '')
+        line_name = line.get('线路名称', '')
+        first_time = line.get('首班车时间', '')
+        last_time = line.get('末班车时间', '')
+        start_station = line.get('起点站点', '')
+        end_station = line.get('终点站点', '')
+        station_list = line.get('站点列表', '')
+        
+        result += f"{line_id}（{line_name}）：\n"
+        result += f"  首班车时间：{first_time}\n"
+        result += f"  末班车时间：{last_time}\n"
+        result += f"  起点站：{start_station}\n"
+        result += f"  终点站：{end_station}\n"
+        
+        if station_list:
+            stations = station_list.split(',')
+            result += f"  站点列表：共{len(stations)}个站点，分别是：{'、'.join(stations)}\n"
+    
     return result
 
 
@@ -789,6 +817,11 @@ def format_line_info(data):
         result += f"  末班车：{line.get('末班车时间', '')}\n"
         result += f"  起点站：{line.get('起点站点', '')}\n"
         result += f"  终点站：{line.get('终点站点', '')}\n"
+        
+        station_list = line.get('站点列表', '')
+        if station_list:
+            stations = station_list.split(',')
+            result += f"  站点：{'、'.join(stations)}\n"
     return result
 
 
@@ -848,74 +881,7 @@ def format_route_info(data):
     return result
 
 
-def get_subway_knowledge_from_db() -> str:
-    """从数据库获取地铁领域知识，不使用缓存，确保实时查询"""
-    print("[DB] 正在从数据库查询实时数据...")
-    subway_knowledge = ""
-    try:
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
 
-            cursor.execute('SELECT * FROM 线路信息表')
-            lines = cursor.fetchall()
-
-            cursor.execute('SELECT * FROM 站点信息表')
-            stations = cursor.fetchall()
-
-            subway_knowledge += "地铁线路信息：\n"
-            for line in lines:
-                line_id, line_name, first_time, last_time = line
-                
-                line_stations = []
-                for station in stations:
-                    station_id, station_line_ids, transfer_lines, station_order, station_name, x, y, desc = station
-                    if line_id in station_line_ids.split(','):
-                        line_stations.append({
-                            'station_id': station_id,
-                            'station_name': station_name,
-                            'transfer_lines': transfer_lines,
-                            'station_order': station_order
-                        })
-                
-                line_stations.sort(key=lambda s: s['station_order'])
-                
-                subway_knowledge += f"- {line_name}（{line_id}）：共{len(line_stations)}个站点，"
-                subway_knowledge += f"首班车时间{first_time}，末班车时间{last_time}\n"
-                subway_knowledge += f"  站点列表：{'、'.join([s['station_name'] + '(' + s['station_id'] + ')' for s in line_stations])}\n"
-                
-                transfer_stations = [s for s in line_stations if s['transfer_lines'] and s['transfer_lines'] != '-']
-                if transfer_stations:
-                    subway_knowledge += f"  换乘站：{'、'.join([s['station_name'] + '(' + s['station_id'] + ')可换乘' + s['transfer_lines'] for s in transfer_stations])}\n"
-
-        finally:
-            close_db_connection(conn)
-    except Exception as e:
-        print(f"获取数据库知识失败: {e}")
-        subway_knowledge = get_default_knowledge()
-
-    print(f"[DB] 数据库查询完成，获取了 {len(stations)} 个站点数据")
-    return subway_knowledge
-
-
-def get_default_knowledge() -> str:
-    """获取默认地铁知识"""
-    return """地铁线路信息：
-- L1线：首班车时间06:00，末班车时间23:00
-- L2线：首班车时间06:00，末班车时间23:00
-- L3线：首班车时间06:00，末班车时间23:00
-
-站点信息：
-- S1站：可换乘L1线
-- S2站：可换乘L1线
-- S3站：可换乘L1线
-- S5站：可换乘L2线
-- S6站：可换乘L2线
-- S7站：可换乘L2线
-- S8站：可换乘L2线
-- S9站：可换乘L3线
-- S10站：可换乘L3线
-"""
 
 
 def handle_chat_intent(question: str) -> Optional[str]:
@@ -943,6 +909,36 @@ def handle_chat_intent(question: str) -> Optional[str]:
             return "我是地铁智能问答系统的AI助手，基于火山引擎豆包大模型构建，可以回答您关于地铁线路、站点、时刻表等问题，也可以解答地铁故障处置等规章问题。"
 
     return None
+
+
+def clean_answer(answer: str) -> str:
+    """清理回答中的常见免责声明和多余内容"""
+    if not answer:
+        return answer
+    
+    # 清理常见的前缀
+    answer = answer.replace("问题：", "").replace("回答：", "").replace("答：", "").replace("答案：", "").strip()
+    
+    # 清理常见的免责声明和提示语
+    disclaimers = [
+        "请注意", "需要注意", "请留意", 
+        "根据最新", "需要更新", "可能更新",
+        "实际情况", "仅供参考", "以官方为准",
+        "可能需要", "建议您", "请您"
+    ]
+    for disclaimer in disclaimers:
+        if disclaimer in answer:
+            # 找到包含免责声明的句子并删除
+            sentences = answer.split("。")
+            filtered_sentences = []
+            for sentence in sentences:
+                if disclaimer not in sentence and sentence.strip():
+                    filtered_sentences.append(sentence.strip())
+            answer = "。".join(filtered_sentences)
+            if answer and not answer.endswith("。"):
+                answer += "。"
+    
+    return answer
 
 
 def generate_answer_with_context(
@@ -987,7 +983,7 @@ def generate_answer_with_context(
         else:
             knowledge_info = subway_knowledge
             print(f"[DEBUG] 使用数据库知识（本地模型），长度: {len(knowledge_info)} 字符")
-            user_prompt = f"""你是地铁信息查询专家。根据提供的数据回答问题。
+            user_prompt = f"""你是地铁信息查询专家。根据提供的数据准确回答问题。
 
 数据：
 {knowledge_info}
@@ -995,10 +991,11 @@ def generate_answer_with_context(
 问题：{question}
 
 回答要求：
-1. 只输出答案本身，不要添加任何额外说明、免责声明或客套话
-2. 不要说明数据来源，不要问用户是否需要更多信息
-3. 回答要简洁、直接、准确
-4. 如果没有相关信息，只输出"暂无相关信息"
+1. 必须严格从数据中提取信息，绝对不能编造数据
+2. 站点列表是逗号分隔的，如"S1,S2,S3"表示3个站点
+3. 数字必须准确，例如问"有几个站"必须精确计数
+4. 只输出答案本身，不要添加任何额外说明
+5. 如果数据中没有相关信息，只输出"暂无相关信息"
 
 答案："""
     else:
@@ -1057,7 +1054,7 @@ def generate_answer_with_context(
                 answer = str(response).strip()
             
             print(f"[DEBUG] 模型回答: {answer}")
-            answer = answer.replace("问题：", "").replace("回答：", "").replace("答：", "").replace("答案：", "").strip()
+            answer = clean_answer(answer)
             return answer
         except Exception as e:
             print(f"模型调用失败: {e}")
@@ -1072,7 +1069,7 @@ def generate_answer_with_context(
             response = llm_local.invoke(user_prompt)
             answer = response.strip()
             print(f"[DEBUG] Ollama模型回答: {answer}")
-            answer = answer.replace("问题：", "").replace("回答：", "").replace("答：", "").replace("答案：", "").strip()
+            answer = clean_answer(answer)
             return answer
         except Exception as e:
             print(f"Ollama模型调用失败: {e}")
@@ -1116,7 +1113,9 @@ def generate_answer_with_context(
         if "choices" in response_data and len(response_data["choices"]) > 0:
             choice = response_data["choices"][0]
             if "message" in choice and "content" in choice["message"]:
-                return choice["message"]["content"]
+                answer = choice["message"]["content"]
+                answer = clean_answer(answer)
+                return answer
 
     except Exception as e:
         print(f"AI API调用失败: {e}")
@@ -1468,6 +1467,366 @@ def format_flow_for_llm(data: dict) -> str:
             result += f"  统计周期: {data['date_range'].get('start_date', '')} 至 {data['date_range'].get('end_date', '')}\n"
     
     return result.strip()
+
+
+async def stream_ollama_response(question: str, data_str: str, knowledge_context: str, llm, is_ollama: bool):
+    """
+    流式生成Ollama响应（G方案+ H方案整合）
+    """
+    # 使用 generate_answer_with_context 的提示词逻辑
+    if is_ollama:
+        if knowledge_context:
+            user_prompt = f"""你是地铁信息查询专家。请严格按照下面的参考知识回答用户问题。
+
+参考知识：
+{knowledge_context}
+
+问题：{question}
+
+回答要求：
+1. 只能使用参考知识中的信息，绝对不能编造任何信息
+2. 不要添加任何参考知识中没有的内容或推测
+3. 不要说"根据规定"、"一般来说"等不确定的表述
+4. 如果参考知识中有明确数字（如重量、尺寸），必须准确使用这些数字
+5. 回答要直接、简洁，只输出答案本身
+6. 如果参考知识中没有相关信息，只输出"暂无相关信息"
+
+回答："""
+        else:
+            user_prompt = f"""你是地铁信息查询专家。根据提供的数据回答问题。
+
+数据：
+{data_str}
+
+问题：{question}
+
+回答要求：
+1. 只输出答案本身，不要添加任何额外说明、免责声明或客套话
+2. 不要说明数据来源，不要问用户是否需要更多信息
+3. 回答要简洁、直接、准确
+4. 如果没有相关信息，只输出"暂无相关信息"
+
+答案："""
+    else:
+        if knowledge_context:
+            user_prompt = f"""你是地铁信息查询专家。请根据下面的参考知识，详细回答用户的问题。
+
+参考知识：
+{knowledge_context}
+
+问题：{question}
+
+回答要求：
+1. 必须完全基于参考知识回答，不要编造信息
+2. 使用参考知识中的具体数据和规定，引用所有相关细节
+3. 如果参考知识中有明确数字（如重量、尺寸、时间），必须使用这些数字
+4. 回答要详细、自然、有逻辑性，像与人对话一样
+5. 可以适当分段，使用列表或步骤说明让回答更清晰
+6. 如果参考知识中没有相关信息，只说"暂无相关信息"
+
+回答："""
+        else:
+            user_prompt = f"""你是地铁信息查询专家。根据提供的数据，详细回答用户的问题。
+
+数据：
+{data_str}
+
+问题：{question}
+
+回答要求：
+1. 基于提供的数据进行详细解答，包含所有相关信息
+2. 使用数据中的具体数字和细节，不要遗漏重要信息
+3. 回答要详细、自然、易懂，可以适当组织成段落或列表
+4. 对于路线规划，描述清楚每一步怎么走
+5. 对于客流数据，说明具体的统计结果和趋势
+6. 如果没有相关信息，只输出"暂无相关信息"
+
+答案："""
+
+    try:
+        # 使用Ollama的流式接口
+        if is_ollama:
+            # 直接调用ollama API进行流式输出
+            ollama_url = "http://localhost:11434/api/generate"
+            payload = {
+                "model": llm.model,
+                "prompt": user_prompt,
+                "stream": True,
+                "options": {
+                    "temperature": 0.1
+                }
+            }
+            
+            response = requests.post(ollama_url, json=payload, stream=True)
+            for line in response.iter_lines():
+                if line:
+                    chunk = json.loads(line.decode('utf-8'))
+                    if 'response' in chunk:
+                        yield f"data: {json.dumps({'content': chunk['response']}, ensure_ascii=False)}\n\n"
+                    if chunk.get('done'):
+                        break
+        else:
+            # 火山引擎API也支持流式输出
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {ARK_API_KEY}"
+            }
+            
+            payload = {
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": user_prompt}],
+                "temperature": 0.7,
+                "stream": True
+            }
+            
+            response = requests.post(ARK_API_URL, headers=headers, json=payload, stream=True)
+            for line in response.iter_lines():
+                if line and line.startswith(b'data: '):
+                    line = line[6:]
+                    if line.strip() == b'[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(line.decode('utf-8'))
+                        if 'choices' in chunk and len(chunk['choices']) > 0:
+                            delta = chunk['choices'][0].get('delta', {})
+                            if 'content' in delta:
+                                yield f"data: {json.dumps({'content': delta['content']}, ensure_ascii=False)}\n\n"
+                    except:
+                        pass
+                    
+        yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+    except Exception as e:
+        print(f"[ERROR] 流式响应错误: {e}")
+        yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+
+async def generate_stream_response(request_data: dict):
+    """
+    生成流式响应数据的辅助函数
+    """
+    try:
+        question = request_data.get('question', '').strip()
+        user_id = request_data.get('user_id', 'default')
+        model_type = request_data.get('model_type', None)
+
+        if not question:
+            yield f"data: {json.dumps({'content': '您好！我是地铁智能助手，有什么可以帮您的吗？'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+            return
+
+        llm = None
+        is_ollama = False
+
+        # 判断使用哪个模型
+        local_use_ollama = False
+        local_use_ark = False
+        if model_type == "ollama":
+            local_use_ollama = True
+            local_use_ark = False
+        elif model_type == "ark":
+            local_use_ollama = False
+            local_use_ark = True
+        else:
+            DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "ollama")
+            if DEFAULT_MODEL == "ark":
+                local_use_ollama = False
+                local_use_ark = True
+            else:
+                local_use_ollama = os.environ.get("USE_OLLAMA", "false").lower() == "true"
+                local_use_ark = os.environ.get("USE_ARK_API", "false").lower() == "true"
+
+        if local_use_ollama:
+            try:
+                from langchain_community.llms import Ollama
+                os.environ["OLLAMA_GPU_LAYERS"] = "33"
+                llm = Ollama(
+                    model=OLLAMA_MODEL,
+                    temperature=0.1
+                )
+                is_ollama = True
+            except Exception as e:
+                print(f"[WARNING] 无法加载Ollama模型: {e}")
+
+        if not llm and local_use_ark:
+            try:
+                from langchain.chat_models import ChatOpenAI
+                llm = ChatOpenAI(
+                    base_url=ARK_API_URL,
+                    api_key=ARK_API_KEY,
+                    model_name=MODEL_NAME,
+                    temperature=0.7,
+                    max_tokens=2000
+                )
+            except Exception as e:
+                print(f"[WARNING] 无法加载火山引擎API: {e}")
+
+        # 使用小型分类模型进行意图识别（速度更快）
+        intent, intent_name, entities = route_question(question)
+
+        # 返回意图信息
+        yield f"data: {json.dumps({'intent': intent_name, 'slots': entities}, ensure_ascii=False)}\n\n"
+
+        # 根据意图处理
+        if intent == INTENT_CHAT:
+            chat_response = handle_chat_intent(question)
+            if chat_response:
+                yield f"data: {json.dumps({'content': chat_response}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+                return
+
+        # 获取相关数据和知识
+        knowledge_context = ""
+        data_str = ""
+        fallback_response = None
+
+        if intent == INTENT_KNOWLEDGE:
+            knowledge_context = get_retrieval_context(question, k=3)
+            if knowledge_context:
+                print(f"RAG检索到 {len(knowledge_context)} 字的相关知识")
+        elif intent == INTENT_STATION_INFO:
+            station_id = entities.get('stations')[0] if entities.get('stations') else None
+            query_result = SQLQueryEngine.query_station_info(station_id)
+            if query_result['success']:
+                data_str = json.dumps(query_result['data'], ensure_ascii=False, indent=2)
+            else:
+                fallback_response = query_result['message']
+        elif intent == INTENT_LINE_INFO:
+            line_id = entities.get('lines')[0] if entities.get('lines') else None
+            query_result = SQLQueryEngine.query_line_info(line_id)
+            if query_result['success']:
+                data_str = json.dumps(query_result['data'], ensure_ascii=False, indent=2)
+            else:
+                fallback_response = query_result['message']
+        elif intent == INTENT_PASSENGER_FLOW:
+            question_lower = question.lower()
+            station_id = entities.get('stations')[0] if entities.get('stations') else None
+
+            if any(keyword in question_lower for keyword in ["最多", "第二", "排行", "排名", "最少"]):
+                analysis_result = PassengerFlowAnalyzer.get_flow_ranking()
+            elif station_id and any(keyword in question_lower for keyword in ["哪一天", "日期", "几号"]):
+                import re
+                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', question)
+                date = date_match.group(1) if date_match else None
+                analysis_result = PassengerFlowAnalyzer.get_station_flow_by_date(station_id, date)
+            elif station_id:
+                analysis_result = PassengerFlowAnalyzer.get_station_flow_by_date(station_id)
+            else:
+                analysis_result = PassengerFlowAnalyzer.get_flow_stats()
+
+            if analysis_result['success']:
+                data_str = format_flow_for_llm(analysis_result['data'])
+            else:
+                fallback_response = analysis_result['message']
+        elif intent == INTENT_ROUTE_RECOMMEND:
+            start_station = entities.get('start_station')
+            end_station = entities.get('end_station')
+
+            if not start_station or not end_station:
+                fallback_response = "请告诉我起点站和终点站，我来为您规划路线"
+            else:
+                route_result = RoutePlanner.find_route(start_station, end_station)
+                if route_result['success']:
+                    data_str = json.dumps(route_result['data'], ensure_ascii=False, indent=2)
+                else:
+                    fallback_response = route_result['message']
+        else:
+            data_str = ""
+
+        if fallback_response:
+            yield f"data: {json.dumps({'content': fallback_response}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+            return
+
+        # 开始流式输出回答
+        if is_ollama:
+            # 使用Ollama的流式接口
+            ollama_url = "http://localhost:11434/api/generate"
+            if knowledge_context:
+                user_prompt = f"""你是地铁信息查询专家。请严格按照下面的参考知识回答用户问题。
+
+参考知识：
+{knowledge_context}
+
+问题：{question}
+
+回答要求：
+1. 只能使用参考知识中的信息，绝对不能编造任何信息
+2. 不要添加任何参考知识中没有的内容或推测
+3. 不要说"根据规定"、"一般来说"等不确定的表述
+4. 如果参考知识中有明确数字（如重量、尺寸），必须准确使用这些数字
+5. 回答要直接、简洁，只输出答案本身
+6. 如果参考知识中没有相关信息，只输出"暂无相关信息"
+
+回答："""
+            else:
+                user_prompt = f"""你是地铁信息查询专家。根据提供的数据回答问题。
+
+数据：
+{data_str}
+
+问题：{question}
+
+回答要求：
+1. 只输出答案本身，不要添加任何额外说明、免责声明或客套话
+2. 不要说明数据来源，不要问用户是否需要更多信息
+3. 回答要简洁、直接、准确
+4. 如果没有相关信息，只输出"暂无相关信息"
+
+答案："""
+                
+            payload = {
+                "model": llm.model,
+                "prompt": user_prompt,
+                "stream": True,
+                "options": {
+                    "temperature": 0.1
+                }
+            }
+            
+            try:
+                response = requests.post(ollama_url, json=payload, stream=True)
+                for line in response.iter_lines():
+                    if line:
+                        chunk = json.loads(line.decode('utf-8'))
+                        if 'response' in chunk:
+                            yield f"data: {json.dumps({'content': chunk['response']}, ensure_ascii=False)}\n\n"
+                        if chunk.get('done'):
+                            break
+            except Exception as e:
+                print(f"[ERROR] Ollama流式错误: {e}")
+                # 回退到非流式
+                answer = generate_answer_with_context(question, data_str, knowledge_context, llm, is_ollama)
+                yield f"data: {json.dumps({'content': answer}, ensure_ascii=False)}\n\n"
+        else:
+            # 回退到非流式调用，直接调用generate_answer_with_context
+            answer = generate_answer_with_context(question, data_str, knowledge_context, llm, is_ollama)
+            yield f"data: {json.dumps({'content': answer}, ensure_ascii=False)}\n\n"
+            
+        yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+
+    except Exception as e:
+        print(f"[ERROR] 流式AI查询错误: {e}")
+        import traceback
+        traceback.print_exc()
+        yield f"data: {json.dumps({'content': f'抱歉，系统出现错误：{str(e)}'}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+
+
+@app.post("/api/ai-query/stream")
+async def ai_query_stream(request: dict):
+    """
+    流式输出AI智能问答接口（G方案 + H方案整合）
+    支持SSE流式响应，提升用户体验
+    """
+    return StreamingResponse(
+        generate_stream_response(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 if __name__ == "__main__":

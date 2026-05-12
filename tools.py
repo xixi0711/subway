@@ -9,25 +9,78 @@
 from typing import Dict, Any, List, Tuple
 import sqlite3
 from collections import defaultdict
+from queue import Queue
+import threading
 
 DB_PATH = './subway.db'
 
+# 数据库连接池
+class ConnectionPool:
+    def __init__(self, max_connections=5):
+        self.max_connections = max_connections
+        self.pool = Queue(maxsize=max_connections)
+        self.lock = threading.Lock()
+        # 预创建连接
+        for _ in range(min(2, max_connections)):
+            conn = self._create_connection()
+            if conn:
+                self.pool.put(conn)
+    
+    def _create_connection(self):
+        """创建新的数据库连接"""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            return conn
+        except Exception as e:
+            print(f"[DB] 创建数据库连接失败: {e}")
+            return None
+    
+    def get_connection(self):
+        """从连接池获取连接"""
+        try:
+            # 先尝试从池中获取
+            if not self.pool.empty():
+                return self.pool.get(timeout=1)
+            # 如果池为空且未达到最大连接数，创建新连接
+            with self.lock:
+                if self.pool.qsize() < self.max_connections:
+                    conn = self._create_connection()
+                    if conn:
+                        return conn
+            # 等待可用连接
+            return self.pool.get(timeout=5)
+        except Exception as e:
+            print(f"[DB] 获取数据库连接失败: {e}")
+            return self._create_connection()
+    
+    def release_connection(self, conn):
+        """释放连接回连接池"""
+        try:
+            if conn:
+                # 只在池未满时放回
+                if self.pool.qsize() < self.max_connections:
+                    self.pool.put(conn, block=False)
+                else:
+                    conn.close()
+        except Exception as e:
+            print(f"[DB] 释放数据库连接失败: {e}")
+            try:
+                conn.close()
+            except:
+                pass
+
+# 全局连接池实例
+_connection_pool = ConnectionPool(max_connections=5)
 
 def get_db_connection():
-    """获取数据库连接"""
-    return sqlite3.connect(DB_PATH)
+    """从连接池获取数据库连接"""
+    return _connection_pool.get_connection()
 
 
 def close_db_connection(conn):
-    """关闭数据库连接"""
-    try:
-        conn.commit()
-        conn.close()
-    except:
-        try:
-            conn.close()
-        except:
-            pass
+    """释放数据库连接回连接池"""
+    _connection_pool.release_connection(conn)
 
 
 class PassengerFlowAnalyzer:
