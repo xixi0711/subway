@@ -84,8 +84,8 @@ export const api = {
     return apiClient.post('/ai-query', payload)
   },
   // 流式AI问答
-  aiQueryStream(question, userId = 'default', modelType = null, onChunk, onComplete, onError) {
-    const payload = { question, user_id: userId }
+  aiQueryStream(question, userId = 'default', modelType = null, history = [], onChunk, onComplete, onError) {
+    const payload = { question, user_id: userId, history }
     if (modelType) {
       payload.model_type = modelType
     }
@@ -154,6 +154,11 @@ export const api = {
   // RAG知识库
   buildKnowledgeBase() {
     return apiClient.post('/knowledge/build')
+  },
+  
+  // 模型管理
+  getModels() {
+    return apiClient.get('/models')
   }
 }
 

@@ -4,6 +4,8 @@ Thumbs.db
 *.swp
 *.swo
 *~
+ehthumbs.db
+desktop.ini
 
 # Python相关
 __pycache__/
@@ -14,6 +16,10 @@ venv/
 .env
 .env.local
 .env.*.local
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
 
 # 前端相关
 node_modules/
@@ -23,6 +29,17 @@ build/
 .npmrc
 .yarnrc
 .pnpm-store/
+.next/
+.output/
+
+# Ollama和模型文件（大型文件）
+Software/
+Software/Ollama/
+Software/blobs/
+C:\Users\yq\.ollama/
+.ollama/
+*.gguf
+*.bin
 
 # 缓存和数据
 cache/
@@ -32,6 +49,7 @@ vector_store/
 vector_db/
 models/
 intent_model/
+knowledge_base/*.docx
 
 # IDE相关
 .vscode/
@@ -39,17 +57,39 @@ intent_model/
 *.iml
 *.ipr
 *.iws
+.project
+.classpath
+.settings/
 
 # 构建产物
 *.egg-info/
 dist/
 build/
 *.whl
+*.egg
 
 # 日志文件
 *.log
 logs/
+*.out
 
 # 临时文件
 *.tmp
 *.temp
+*.bak
+*.backup
+
+# 敏感文件
+*.key
+*.pem
+*.crt
+*.p12
+secrets/
+credentials/
+
+# 文档和备份
+*.docx
+*.pdf
+*.xlsx
+*.pptx
+~$*.docx

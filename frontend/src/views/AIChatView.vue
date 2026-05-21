@@ -5,11 +5,17 @@
       <a-space>
         <a-select
           v-model:value="selectedModel"
-          style="width: 160px"
+          style="width: 200px"
+          :disabled="modelsLoading"
           @change="handleModelChange"
         >
-          <a-select-option value="ollama">本地模型 (Ollama)</a-select-option>
-          <a-select-option value="ark">火山引擎 (API)</a-select-option>
+          <a-select-option 
+            v-for="model in models" 
+            :key="model.key" 
+            :value="model.key"
+          >
+            {{ model.name }}
+          </a-select-option>
         </a-select>
         <a-button @click="handleClearCache" type="default" danger>
           <template #icon><ReloadOutlined /></template>
@@ -79,7 +85,32 @@ const store = useSubwayStore()
 const chatContainer = ref(null)
 const question = ref('')
 const clearingCache = ref(false)
-const selectedModel = ref(localStorage.getItem('selectedModel') || 'ollama')
+const models = ref([])
+const modelsLoading = ref(true)
+const selectedModel = ref(localStorage.getItem('selectedModel') || 'ollama-qwen7b')
+
+const loadModels = async () => {
+  try {
+    const response = await api.getModels()
+    if (response.code === 200) {
+      models.value = response.data
+      // 如果当前选中的模型不在列表中，选择第一个
+      if (!models.value.some(m => m.key === selectedModel.value)) {
+        selectedModel.value = models.value[0]?.key || 'ollama-qwen7b'
+        localStorage.setItem('selectedModel', selectedModel.value)
+      }
+    }
+  } catch (error) {
+    console.error('加载模型列表失败:', error)
+    // 使用默认模型列表
+    models.value = [
+      { key: 'ollama-qwen7b', name: 'Qwen 2.5 7B', description: 'Qwen2.5 7B模型，精度高' },
+      { key: 'ark', name: '火山引擎API', description: '云端API模型' }
+    ]
+  } finally {
+    modelsLoading.value = false
+  }
+}
 
 let userId = localStorage.getItem('userId')
 if (!userId) {
@@ -146,7 +177,8 @@ watch(() => store.chatMessages, () => {
   scrollToBottom()
 }, { deep: true })
 
-onMounted(() => {
+onMounted(async () => {
+  await loadModels()
   store.initChat()
   scrollToBottom()
 })
@@ -161,6 +193,20 @@ onMounted(() => {
   .page-header {
     margin-bottom: 24px;
     h2 { margin: 0; font-size: 24px; font-weight: 600; }
+  }
+  
+  .model-tooltip {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    line-height: 14px;
+    text-align: center;
+    background: #e8e8e8;
+    border-radius: 50%;
+    font-size: 12px;
+    color: #999;
+    margin-left: 4px;
+    cursor: help;
   }
 
   .chat-card {

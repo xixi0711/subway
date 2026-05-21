@@ -39,12 +39,17 @@ def calculate_passenger_flow():
     finally:
         close_db_connection(conn)
 
-def get_station_passenger_flow(station_id):
+def get_station_passenger_flow(station_id, start_date=None, end_date=None):
     """获取站点客流数据"""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute('SELECT * FROM 客流统计表 WHERE 站点编号=? ORDER BY 统计日期 DESC LIMIT 7', (station_id,))
+        
+        if start_date and end_date:
+            cursor.execute('SELECT * FROM 客流统计表 WHERE 站点编号=? AND 统计日期 BETWEEN ? AND ? ORDER BY 统计日期 DESC', 
+                          (station_id, start_date, end_date))
+        else:
+            cursor.execute('SELECT * FROM 客流统计表 WHERE 站点编号=? ORDER BY 统计日期 DESC LIMIT 7', (station_id,))
         rows = cursor.fetchall()
         
         result = []

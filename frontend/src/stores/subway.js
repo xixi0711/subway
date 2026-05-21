@@ -339,7 +339,20 @@ export const useSubwayStore = defineStore('subway', () => {
     
     try {
       if (USE_STREAM) {
-        api.aiQueryStream(question.trim(), userId, modelType, onChunk, onComplete, onError)
+        // 构建历史对话上下文（只保留最近一轮）
+        const history = []
+        let lastUserMessage = null
+        for (let i = chatMessages.value.length - 1; i >= 0; i--) {
+          const msg = chatMessages.value[i]
+          if (msg.type === 'bot' && lastUserMessage) {
+            history.unshift({ user: lastUserMessage, assistant: msg.content })
+            break  // 只取一轮
+          } else if (msg.type === 'user') {
+            lastUserMessage = msg.content
+          }
+        }
+        
+        api.aiQueryStream(question.trim(), userId, modelType, history, onChunk, onComplete, onError)
       } else {
         // 回退到非流式
         const response = await api.aiQuery(question.trim(), userId, modelType)

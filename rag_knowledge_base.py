@@ -6,23 +6,57 @@ import os
 import re
 from typing import List, Dict, Any
 
-# 禁用 Hugging Face 网络访问，强制使用本地缓存
+try:
+    from PyPDF2 import PdfReader
+    HAS_PYPDF2 = True
+except ImportError:
+    HAS_PYPDF2 = False
+    print("[RAG] 警告: PyPDF2 未安装，无法解析PDF文件")
+
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
-# 全局变量
 _vector_db = None
 _embedding = None
 _initialized = False
 
 
-def _init():
-    """初始化向量数据库和嵌入模型（只执行一次）"""
+def _read_pdf(file_path: str) -> str:
+    if not HAS_PYPDF2:
+        return ""
+    try:
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n\n"
+        return text.strip()
+    except Exception as e:
+        print(f"[RAG] 解析PDF失败 {file_path}: {e}")
+        return ""
+
+
+def _read_file(file_path: str) -> str:
+    _, ext = os.path.splitext(file_path)
+    if ext.lower() == '.pdf':
+        return _read_pdf(file_path)
+    elif ext.lower() == '.txt':
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception as e:
+            print(f"[RAG] 读取TXT失败 {file_path}: {e}")
+            return ""
+    else:
+        print(f"[RAG] 不支持的文件格式: {ext}")
+        return ""
+
+
+def _init(force_reload: bool = False):
+    """初始化向量数据库和嵌入模型"""
     global _vector_db, _embedding, _initialized
     
-    if _initialized:
+    if _initialized and not force_reload:
         return
-    
     try:
         from langchain_community.vectorstores import FAISS
         from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -30,11 +64,8 @@ def _init():
         from langchain.schema import Document
         
         print("[RAG] 正在初始化向量数据库...")
-        
-        # 1. 初始化嵌入模型 - 优先使用本地缓存
         print("[RAG] 正在加载嵌入模型...")
         
-        # 检查本地缓存
         user_profile = os.environ.get('USERPROFILE', '')
         cache_path = os.path.join(user_profile, '.cache', 'huggingface', 'hub', 'models--BAAI--bge-small-zh')
         
@@ -47,7 +78,6 @@ def _init():
         
         print("[RAG] 嵌入模型加载完成")
         
-        # 2. 检查是否有已保存的向量库
         if os.path.exists("vector_db"):
             print("[RAG] 正在加载已保存的向量库...")
             _vector_db = FAISS.load_local("vector_db", _embedding, allow_dangerous_deserialization=True)
@@ -66,11 +96,17 @@ def _init():
         _initialized = False
 
 
+def reload_vector_db():
+    """强制重新加载向量库"""
+    global _initialized
+    _initialized = False
+    _init(force_reload=True)
+    print("[RAG] 向量库已重新加载")
+
+
 def build_knowledge_base(directory: str = "./knowledge_base") -> int:
-    """从目录构建知识库（纯段落级）"""
     global _vector_db, _embedding, _initialized
     
-    # 确保初始化（但不是在导入时）
     if not _initialized:
         try:
             _init()
@@ -82,22 +118,22 @@ def build_knowledge_base(directory: str = "./knowledge_base") -> int:
     from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain.schema import Document
     
-    # 段落级文档列表
     paragraph_docs = []
     
     if not os.path.exists(directory):
         print(f"[RAG] 目录不存在: {directory}")
         return 0
     
-    # 加载所有文档并按段落分割
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
         if os.path.isfile(file_path):
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                content = _read_file(file_path)
                 
-                # 按段落分割（空行分隔）
+                if not content:
+                    print(f"[RAG] 文件内容为空: {filename}")
+                    continue
+                
                 paragraphs = re.split(r'\n\n+', content)
                 
                 for i, paragraph in enumerate(paragraphs):
@@ -121,7 +157,6 @@ def build_knowledge_base(directory: str = "./knowledge_base") -> int:
     
     print(f"[RAG] 共 {len(paragraph_docs)} 个段落")
     
-    # 创建向量库（每个段落作为独立向量）
     print("[RAG] 正在创建段落级向量库...")
     
     if _embedding is None:
@@ -129,18 +164,15 @@ def build_knowledge_base(directory: str = "./knowledge_base") -> int:
     
     _vector_db = FAISS.from_documents(paragraph_docs, _embedding)
     
-    # 保存向量库
     print("[RAG] 正在保存向量库...")
     _vector_db.save_local("vector_db")
     
-    _initialized = True
     print(f"[RAG] 知识库构建完成，共 {len(paragraph_docs)} 个段落")
     
     return len(paragraph_docs)
 
 
 def add_knowledge(content: str, metadata: Dict[str, Any] = None) -> bool:
-    """添加单条知识"""
     from langchain.schema import Document
     
     _init()
@@ -158,8 +190,6 @@ def add_knowledge(content: str, metadata: Dict[str, Any] = None) -> bool:
 
 
 def retrieve_knowledge(query: str, k: int = 3) -> List[Dict[str, Any]]:
-    """检索知识"""
-    # 第一次使用时才初始化
     if not _initialized:
         try:
             _init()
@@ -183,7 +213,6 @@ def retrieve_knowledge(query: str, k: int = 3) -> List[Dict[str, Any]]:
     return retrieved
 
 
-# 同义词映射表 - 用于增强检索效果
 SYNONYMS = {
     "包裹": ["行李", "物品", "行李物品", "包裹行李"],
     "行李": ["包裹", "物品", "行李物品", "包裹行李"],
@@ -197,8 +226,8 @@ SYNONYMS = {
     "换乘": ["转乘", "换乘站", "转车"],
 }
 
+
 def expand_query_with_synonyms(query: str) -> str:
-    """使用同义词扩展查询，提高检索召回率"""
     expanded_terms = [query]
     
     for word, synonyms in SYNONYMS.items():
@@ -211,8 +240,6 @@ def expand_query_with_synonyms(query: str) -> str:
 
 
 def get_retrieval_context(query: str, k: int = 3) -> str:
-    """获取检索上下文，用于增强prompt（纯段落级检索）"""
-    # 第一次使用时才初始化
     if not _initialized:
         try:
             _init()
@@ -224,15 +251,12 @@ def get_retrieval_context(query: str, k: int = 3) -> str:
         print(f"[RAG] RAG 未初始化，跳过检索")
         return ""
     
-    # 使用同义词扩展查询，提高召回率
     expanded_query = expand_query_with_synonyms(query)
     print(f"[RAG] 原始查询: {query}")
     print(f"[RAG] 扩展查询: {expanded_query}")
     
-    # 先使用扩展查询进行检索
     results = retrieve_knowledge(expanded_query, k=k)
     
-    # 如果扩展查询没有结果，使用原始查询
     if not results:
         results = retrieve_knowledge(query, k=k)
     
@@ -252,14 +276,12 @@ def get_retrieval_context(query: str, k: int = 3) -> str:
         source = result['metadata'].get('source', 'unknown')
         paragraph = result['metadata'].get('paragraph', 0)
         
-        # 段落级相似度阈值过滤
-        if score < 0.3:
-            print(f"[RAG] 跳过段落{i} - 相似度: {score:.4f} (低于阈值0.3)")
+        if score < 0.4:
+            print(f"[RAG] 跳过段落{i} - 相似度: {score:.4f} (低于阈值0.4)")
             continue
         
         print(f"[RAG] 段落{i} - 语义相似度: {score:.4f}, 来源: {source} 第{paragraph}段")
         
-        # 添加到上下文
         if source not in used_sources:
             context += f"\n【{source}】\n"
             used_sources.add(source)
@@ -268,7 +290,7 @@ def get_retrieval_context(query: str, k: int = 3) -> str:
         total_length += len(content)
     
     if total_length == 0:
-        print(f"[RAG] 没有找到相似度高于0.3的段落")
+        print(f"[RAG] 没有找到相似度高于0.4的段落")
         return ""
     
     print(f"[RAG] 最终上下文长度: {total_length} 字")
@@ -276,12 +298,10 @@ def get_retrieval_context(query: str, k: int = 3) -> str:
     return context
 
 
-# 立即初始化 - 在模块导入时就初始化向量数据库
-# 避免第一次请求时的长时间加载
 _init()
 
+
 def preload_rag():
-    """预加载RAG向量数据库（在应用启动时调用）"""
     global _initialized
     if not _initialized:
         _init()

@@ -117,7 +117,7 @@ MODEL_NAME=your-model-name
 
 # Ollama配置（可选）
 USE_OLLAMA=true
-OLLAMA_MODEL=qwen:7b
+OLLAMA_MODEL=qwen2.5:7b
 
 # 数据库配置
 DATABASE_PATH=./subway.db
@@ -182,12 +182,12 @@ ARK_API_KEY=your-key
 1. 安装 Ollama：https://ollama.com/
 2. 下载模型：
 ```bash
-ollama pull qwen:7b
+ollama pull qwen2.5:7b
 ```
 3. 配置 `.env`：
 ```ini
 USE_OLLAMA=true
-OLLAMA_MODEL=qwen:7b
+OLLAMA_MODEL=qwen2.5:7b
 ```
 
 ### GPU加速配置（可选）
